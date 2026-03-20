@@ -79,6 +79,7 @@ const SettingsPage: React.FC = () => {
     'LLM_CHANNELS',
     'LLM_TEMPERATURE',
     'LITELLM_MODEL',
+    'AGENT_LITELLM_MODEL',
     'LITELLM_FALLBACK_MODELS',
     'AIHUBMIX_KEY',
     'DEEPSEEK_API_KEY',
@@ -104,6 +105,13 @@ const SettingsPage: React.FC = () => {
   const SYSTEM_HIDDEN_KEYS = new Set([
     'ADMIN_AUTH_ENABLED',
   ]);
+  const AGENT_HIDDEN_KEYS = new Set([
+    'AGENT_DEEP_RESEARCH_BUDGET',
+    'AGENT_DEEP_RESEARCH_TIMEOUT',
+    'AGENT_EVENT_MONITOR_ENABLED',
+    'AGENT_EVENT_MONITOR_INTERVAL_MINUTES',
+    'AGENT_EVENT_ALERT_RULES_JSON',
+  ]);
   const activeItems =
     activeCategory === 'ai_model'
       ? rawActiveItems.filter((item) => {
@@ -117,6 +125,8 @@ const SettingsPage: React.FC = () => {
       })
       : activeCategory === 'system'
         ? rawActiveItems.filter((item) => !SYSTEM_HIDDEN_KEYS.has(item.key))
+      : activeCategory === 'agent'
+        ? rawActiveItems.filter((item) => !AGENT_HIDDEN_KEYS.has(item.key))
       : rawActiveItems;
 
   return (
@@ -134,6 +144,7 @@ const SettingsPage: React.FC = () => {
             <Button
               type="button"
               variant="settings-secondary"
+              className="border-border/50 bg-muted/30 hover:border-border/70"
               onClick={resetDraft}
               disabled={isLoading || isSaving}
             >
@@ -240,7 +251,7 @@ const SettingsPage: React.FC = () => {
                 ))}
               </SettingsSectionCard>
             ) : (
-              <div className="rounded-[1.5rem] border border-border/45 bg-card/92 p-5 text-sm text-secondary-text shadow-soft-card">
+              <div className="settings-panel-muted rounded-[1.5rem] border p-5 text-sm text-secondary-text shadow-soft-card">
                 当前分类下暂无配置项。
               </div>
             )}

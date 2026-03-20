@@ -89,8 +89,9 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | `OPENAI_API_KEY` | OpenAI-compatible API Key (supports DeepSeek, Qwen, etc.) | Optional |
 | `OPENAI_BASE_URL` | OpenAI-compatible API endpoint (e.g., `https://api.deepseek.com/v1`) | Optional |
 | `OPENAI_MODEL` | Model name (e.g., `deepseek-chat`) | Optional |
+| `OLLAMA_API_BASE` | Ollama local service address (e.g. `http://localhost:11434`), for local/Docker deployment; **do not** use `OPENAI_BASE_URL` for Ollama, see [LLM Config Guide - Ollama](LLM_CONFIG_GUIDE_EN.md#example-4-using-ollama-local-models) | Optional |
 
-> *Note: Configure at least one of `GEMINI_API_KEY` or `OPENAI_API_KEY`
+> *Note: Configure at least one of `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `OLLAMA_API_BASE` (local). **Ollama** requires `OLLAMA_API_BASE`; using `OPENAI_BASE_URL` causes 404.
 
 <details>
 <summary><b>Notification channels</b> (expand, choose at least one)</summary>
@@ -113,7 +114,8 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | `CUSTOM_WEBHOOK_URLS` | Custom Webhook URLs (supports DingTalk, etc., comma-separated) | Optional |
 | `CUSTOM_WEBHOOK_BEARER_TOKEN` | Bearer token for custom webhooks (if required) | Optional |
 | `SINGLE_STOCK_NOTIFY` | Send notification immediately after each stock | Optional |
-| `REPORT_TYPE` | `simple` or `full` (Docker recommended: `full`) | Optional |
+| `REPORT_TYPE` | `simple`, `full`, or `brief` (Docker recommended: `full`) | Optional |
+| `REPORT_LANGUAGE` | Report output language: `zh` (default Chinese) / `en` (English); affects prompt instructions, Markdown templates, notification fallbacks, and fixed labels in the Web report view | Optional |
 | `ANALYSIS_DELAY` | Delay between stocks and market review (seconds) | Optional |
 
 > Note: Configure at least one channel; multiple channels will all receive notifications.
@@ -130,10 +132,13 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/) API (privacy-focused, US stocks optimized) | Optional |
 | `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis) Backup search | Optional |
 | `BOCHA_API_KEYS` | [Bocha Search](https://open.bocha.cn/) Web Search API (Chinese search optimized, supports AI summaries, multiple keys comma-separated) | Optional |
-| `SEARXNG_BASE_URLS` | SearXNG self-hosted instances (quota-free fallback, enable format: json in settings.yml) | Optional |
+| `SEARXNG_BASE_URLS` | SearXNG self-hosted instances (quota-free fallback, enable format: json in settings.yml); when empty the app auto-discovers public instances | Optional |
+| `SEARXNG_PUBLIC_INSTANCES_ENABLED` | Auto-discover public SearXNG instances from `searx.space` when `SEARXNG_BASE_URLS` is empty (default `true`) | Optional |
 | `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638 ) Token | Optional |
+| `TICKFLOW_API_KEY` | [TickFlow](https://tickflow.org) API key (CN market review index enhancement; breadth also uses TickFlow when the plan supports universe queries) | Optional |
 | `WECHAT_MSG_TYPE` | WeChat Work message type, default `markdown`, set to `text` for plain markdown text | Optional |
 | `AGENT_MODE` | Enable Agent strategy chat mode (`true`/`false`, default `false`) | Optional |
+| `AGENT_LITELLM_MODEL` | Optional Agent-only primary model; when empty it inherits `LITELLM_MODEL`, and bare names are normalized to `openai/<model>` | Optional |
 | `AGENT_MAX_STEPS` | Max reasoning steps for Agent mode (default `10`) | Optional |
 | `AGENT_STRATEGY_DIR` | Custom strategy directory (default built-in `strategies/`) | Optional |
 
