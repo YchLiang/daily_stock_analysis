@@ -146,7 +146,7 @@ class StockScreener:
             包含实时行情的 DataFrame
         """
         max_retries = 3
-        retry_delay = 5
+        retry_delay = 30
 
         for attempt in range(max_retries):
             try:
@@ -354,6 +354,10 @@ class StockScreener:
             return [], index_name
 
         logger.info(f"开始从 {len(stock_codes)} 只成分股中筛选...")
+
+        # 延迟30秒，避免高频请求
+        logger.info("等待 30 秒后获取实时行情（避免高频请求）...")
+        time.sleep(30)
 
         # 2. 初筛：过滤 ST 股、停牌股等
         logger.info("执行初筛：过滤 ST 股、停牌股...")
