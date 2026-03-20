@@ -116,7 +116,10 @@ class StockScreener:
                 return []
 
             # 提取股票代码
-            if '股票代码' in df.columns:
+            # AkShare index_stock_cons 返回字段: 品种代码, 品种名称, 纳入日期
+            if '品种代码' in df.columns:
+                codes = df['品种代码'].tolist()
+            elif '股票代码' in df.columns:
                 codes = df['股票代码'].tolist()
             elif 'code' in df.columns:
                 codes = df['code'].tolist()
