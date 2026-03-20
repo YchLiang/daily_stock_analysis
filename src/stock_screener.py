@@ -20,6 +20,7 @@
 """
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 import akshare as ak
@@ -136,7 +137,7 @@ class StockScreener:
 
     def get_realtime_data_batch(self, stock_codes: List[str]) -> pd.DataFrame:
         """
-        批量获取实时行情数据
+        批量获取实时行情数据（带重试机制）
 
         Args:
             stock_codes: 股票代码列表
@@ -144,27 +145,43 @@ class StockScreener:
         Returns:
             包含实时行情的 DataFrame
         """
-        try:
-            logger.info(f"正在获取 {len(stock_codes)} 只股票的实时行情...")
+        max_retries = 3
+        retry_delay = 5
 
-            # 使用 AkShare 获取A股实时行情（支持筛选）
-            df = ak.stock_zh_a_spot_em()
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"正在获取 {len(stock_codes)} 只股票的实时行情... (尝试 {attempt + 1}/{max_retries})")
 
-            # 筛选出目标股票
-            if '代码' in df.columns:
-                df_filtered = df[df['代码'].isin(stock_codes)]
-            elif 'code' in df.columns:
-                df_filtered = df[df['code'].isin(stock_codes)]
-            else:
-                logger.error(f"实时行情数据中没有代码字段: {df.columns.tolist()}")
+                # 使用 AkShare 获取A股实时行情（支持筛选）
+                df = ak.stock_zh_a_spot_em()
+
+                # 筛选出目标股票
+                if '代码' in df.columns:
+                    df_filtered = df[df['代码'].isin(stock_codes)]
+                elif 'code' in df.columns:
+                    df_filtered = df[df['code'].isin(stock_codes)]
+                else:
+                    logger.error(f"实时行情数据中没有代码字段: {df.columns.tolist()}")
+                    return pd.DataFrame()
+
+                logger.info(f"成功获取 {len(df_filtered)} 只股票的实时行情")
+                return df_filtered
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.warning(f"获取实时行情失败 (尝试 {attempt + 1}/{max_retries}): {error_msg}")
+
+                # 如果是连接问题且还有重试机会，等待后重试
+                if 'Connection' in error_msg or 'RemoteDisconnected' in error_msg:
+                    if attempt < max_retries - 1:
+                        logger.info(f"等待 {retry_delay} 秒后重试...")
+                        time.sleep(retry_delay)
+                        continue
+
+                logger.error(f"获取实时行情失败: {e}")
                 return pd.DataFrame()
 
-            logger.info(f"成功获取 {len(df_filtered)} 只股票的实时行情")
-            return df_filtered
-
-        except Exception as e:
-            logger.error(f"获取实时行情失败: {e}")
-            return pd.DataFrame()
+        return pd.DataFrame()
 
     def calculate_stock_scores(self, stock_codes: List[str], top_n: int = 10) -> List[StockScore]:
         """
