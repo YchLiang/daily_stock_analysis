@@ -69,6 +69,7 @@ def parse_arguments() -> argparse.Namespace:
   python main.py --single-notify    # 启用单股推送模式（每分析完一只立即推送）
   python main.py --schedule         # 启用定时任务模式
   python main.py --market-review    # 仅运行大盘复盘
+  python main.py --screen --index 000852 --top-n 2  # 股票筛选：从中证1000筛选2只优质股票
         '''
     )
 
@@ -181,6 +182,26 @@ def parse_arguments() -> argparse.Namespace:
         '--no-context-snapshot',
         action='store_true',
         help='不保存分析上下文快照'
+    )
+
+    parser.add_argument(
+        '--screen',
+        action='store_true',
+        help='股票筛选模式：从指数中筛选优质股票'
+    )
+
+    parser.add_argument(
+        '--index',
+        type=str,
+        default='000852',
+        help='筛选目标指数代码（默认中证1000: 000852）'
+    )
+
+    parser.add_argument(
+        '--top-n',
+        type=int,
+        default=2,
+        help='筛选返回前 N 只股票（默认 2）'
     )
 
     # === Backtest ===
@@ -604,7 +625,129 @@ def main() -> int:
             )
             return 0
 
-        # 模式1: 仅大盘复盘
+        # 模式1: 股票筛选 + AI 深度分析
+        if getattr(args, 'screen', False):
+            from src.stock_screener import StockScreener
+            from src.analyzer import GeminiAnalyzer
+            from src.search_service import SearchService
+            from src.notification import NotificationService
+            from src.core.pipeline import StockAnalysisPipeline
+
+            logger.info("模式: 股票筛选 + AI 深度分析")
+
+            index_code = getattr(args, 'index', '000852')
+            top_n = getattr(args, 'top_n', 2)
+
+            # 步骤1: 技术指标初筛
+            screener = StockScreener()
+            stocks, index_name = screener.screen(index_code=index_code, top_n=top_n)
+
+            if not stocks:
+                logger.info("初筛未找到符合条件的股票，结束筛选流程")
+                return 0
+
+            # 步骤2: AI 深度分析筛选出的股票
+            logger.info(f"\n{'=' * 60}")
+            logger.info(f"🤖 开始对筛选出的 {len(stocks)} 只股票进行 AI 深度分析")
+            logger.info(f"{'=' * 60}")
+
+            # 提取股票代码
+            screen_codes = [stock.code for stock in stocks]
+
+            # 初始化分析组件
+            search_service = None
+            analyzer = None
+            notifier = NotificationService()
+
+            # 初始化搜索服务（如果有配置）
+            if config.has_search_capability_enabled():
+                search_service = SearchService(
+                    bocha_keys=config.bocha_api_keys,
+                    tavily_keys=config.tavily_api_keys,
+                    brave_keys=config.brave_api_keys,
+                    serpapi_keys=config.serpapi_keys,
+                    minimax_keys=config.minimax_api_keys,
+                    searxng_base_urls=config.searxng_base_urls,
+                    searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                    news_max_age_days=config.news_max_age_days,
+                    news_strategy_profile=getattr(config, "news_strategy_profile", ("short",)),
+                )
+
+            # 初始化 AI 分析器（如果有配置）
+            if config.gemini_api_key or config.openai_api_key:
+                analyzer = GeminiAnalyzer(api_key=config.gemini_api_key)
+                if not analyzer.is_available():
+                    logger.warning("AI 分析器初始化后不可用，请检查 API Key 配置")
+                    analyzer = None
+            else:
+                logger.warning("未检测到 API Key (Gemini/OpenAI)，将仅使用模板生成报告")
+
+            # 创建分析 pipeline
+            query_id = uuid.uuid4().hex
+            pipeline = StockAnalysisPipeline(
+                config=config,
+                max_workers=1,  # 筛选数量少，单线程即可
+                query_id=query_id,
+                query_source="screening",
+                save_context_snapshot=not getattr(args, 'no_context_snapshot', False),
+            )
+
+            # 执行 AI 分析
+            if analyzer:
+                results = pipeline.run(
+                    stock_codes=screen_codes,
+                    dry_run=args.dry_run,
+                    send_notification=not args.no_notify,
+                    merge_notification=False,  # 筛选结果单独推送
+                )
+
+                # 步骤3: 生成综合报告（筛选摘要 + AI 决策仪表盘）
+                if results:
+                    from src.stock_screener import format_screener_report
+
+                    # 筛选摘要部分
+                    screener_report = format_screener_report(stocks, index_name)
+
+                    # AI 决策仪表盘部分
+                    dashboard_report = pipeline.notifier.generate_aggregate_report(
+                        results,
+                        'full' if config.report_type == 'full' else config.report_type,
+                    )
+
+                    # 合并报告
+                    combined_report = f"{screener_report}\n\n---\n\n# 🤖 AI 决策仪表盘\n\n{dashboard_report}"
+
+                    # 推送综合报告
+                    if not args.no_notify:
+                        if notifier.is_available():
+                            notifier.send(combined_report)
+                            logger.info("筛选结果 + AI 分析已推送")
+                        else:
+                            logger.warning("未配置通知渠道，跳过推送")
+
+                    print(combined_report)
+                else:
+                    # 仅推送筛选摘要（没有 AI 结果）
+                    from src.stock_screener import format_screener_report
+                    screener_report = format_screener_report(stocks, index_name)
+                    if not args.no_notify:
+                        if notifier.is_available():
+                            notifier.send(screener_report)
+                            logger.info("筛选结果已推送")
+                    print(screener_report)
+            else:
+                # 没有 AI 分析器，仅推送筛选结果
+                from src.stock_screener import format_screener_report
+                screener_report = format_screener_report(stocks, index_name)
+                if not args.no_notify:
+                    if notifier.is_available():
+                        notifier.send(screener_report)
+                        logger.info("筛选结果已推送")
+                print(screener_report)
+
+            return 0
+
+        # 模式2: 仅大盘复盘
         if args.market_review:
             from src.analyzer import GeminiAnalyzer
             from src.core.market_review import run_market_review
@@ -643,7 +786,7 @@ def main() -> int:
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
                     news_max_age_days=config.news_max_age_days,
-                    news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
+                    news_strategy_profile=getattr(config, "news_strategy_profile", ("short",)),
                 )
 
             if config.gemini_api_key or config.openai_api_key:
