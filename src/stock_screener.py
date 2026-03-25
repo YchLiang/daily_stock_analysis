@@ -9,18 +9,18 @@
 2. 使用 StockTrendAnalyzer 完整打分逻辑进行评分
 3. 输出最值得买入的股票候选列表
 
+设计理念（盘后分析）：
+- 使用历史日线数据（get_daily_data），而非实时行情
+- 适合盘后分析场景，不依赖实时行情接口
+- 完整利用 StockTrendAnalyzer 的技术分析能力
+
 筛选逻辑：
 - 使用完整的 StockTrendAnalyzer 打分系统（趋势+乖离率+量能+MACD+RSI+支撑）
 - 只返回买入信号为 STRONG_BUY 或 BUY 的股票
-- 按得分从高到低排序
-
-数据源策略：
-- 使用 DataFetcherManager 统一管理多数据源
-- 支持自动故障切换（akshare_em → efinance → tencent → sina）
+- 按买入信号优先级 + 得分排序
 """
 
 import logging
-import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import akshare as ak
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StockScore:
-    """股票评分数据类（兼容旧代码）"""
+    """股票评分数据类"""
     code: str
     name: str
     price: float
@@ -52,34 +52,22 @@ class StockScore:
     bias_ma5: Optional[float] = None
     volume_ratio: Optional[float] = None
     turnover_rate: Optional[float] = None
-    chip_concentration: Optional[float] = None
-    pe_ratio: Optional[float] = None
-
-    # 筛选条件得分
-    bullish_alignment: int = 0
-    bias_safe: int = 0
-    volume_valid: int = 0
-    chip_healthy: int = 0
-    trend_strength: float = 0.0  # 改为 float，与 TrendAnalysisResult 一致
+    trend_strength: float = 0.0
     total_score: int = 0
-
-    # 标记
     is_bullish: bool = False
-    is_strong_trend: bool = False
-
-    # 新增：完整的分析结果
     analysis_result: Optional[TrendAnalysisResult] = None
     buy_signal: BuySignal = BuySignal.WAIT
 
 
 class StockScreener:
-    """股票筛选器
+    """股票筛选器（盘后分析模式）
 
-    使用 StockTrendAnalyzer 完整打分逻辑，筛选最值得买入的股票。
+    使用历史日线数据 + StockTrendAnalyzer 完整打分逻辑。
 
-    筛选条件：
-    1. 买入信号为 STRONG_BUY 或 BUY
-    2. 按得分从高到低排序
+    优势：
+    - 不依赖实时行情接口，适合盘后分析
+    - 完整的技术分析能力（MA/MACD/RSI等）
+    - 按买入信号筛选，确保返回的是"值得买入"的股票
     """
 
     # 指数代码映射
@@ -142,172 +130,9 @@ class StockScreener:
             logger.error(f"获取指数成分股失败: {e}")
             return []
 
-    def get_realtime_data_batch(self, stock_codes: List[str]) -> pd.DataFrame:
+    def _get_stock_daily_data(self, code: str, days: int = 120) -> Optional[pd.DataFrame]:
         """
-        批量获取实时行情数据（使用多数据源协同）
-
-        策略（按优先级）：
-        1. AkShare 批量接口（stock_zh_a_spot_em）- 一次请求获取全部 A 股
-        2. Efinance 批量接口 - 备选
-        3. DataFetcherManager 逐个获取 - 兜底
-
-        Args:
-            stock_codes: 股票代码列表
-
-        Returns:
-            包含实时行情的 DataFrame
-        """
-        # 方案1: 尝试 AkShare 批量接口（一次请求获取全部，最快）
-        df = self._try_akshare_batch(stock_codes)
-        if not df.empty:
-            return df
-
-        # 方案2: 尝试 Efinance 批量接口
-        df = self._try_efinance_batch(stock_codes)
-        if not df.empty:
-            return df
-
-        # 方案3: 使用 DataFetcherManager 逐个获取（可靠但较慢）
-        logger.info("批量接口全部失败，切换到逐个获取模式（可能较慢）...")
-        return self._fetch_with_multi_sources(stock_codes)
-
-    def _try_akshare_batch(self, stock_codes: List[str]) -> pd.DataFrame:
-        """
-        尝试使用 AkShare 批量接口获取行情（一次请求获取全部 A 股，最快）
-        """
-        max_retries = 2
-        retry_delay = 10
-
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"[AkShare批量] 正在获取 A 股实时行情... (尝试 {attempt + 1}/{max_retries})")
-
-                df = ak.stock_zh_a_spot_em()
-
-                if df is None or df.empty:
-                    logger.warning(f"[AkShare批量] 返回数据为空 (尝试 {attempt + 1}/{max_retries})")
-                    continue
-
-                # 筛选出目标股票
-                code_col = None
-                for col in ['代码', 'code', '股票代码']:
-                    if col in df.columns:
-                        code_col = col
-                        break
-
-                if code_col is None:
-                    logger.error(f"[AkShare批量] 实时行情数据中没有代码字段: {df.columns.tolist()}")
-                    return pd.DataFrame()
-
-                df_filtered = df[df[code_col].astype(str).isin(stock_codes)]
-                logger.info(f"[AkShare批量] 成功获取 {len(df_filtered)} 只股票的实时行情")
-                return df_filtered
-
-            except Exception as e:
-                error_msg = str(e)
-                logger.warning(f"[AkShare批量] 获取失败 (尝试 {attempt + 1}/{max_retries}): {error_msg}")
-
-                if 'Connection' in error_msg or 'RemoteDisconnected' in error_msg or 'timeout' in error_msg.lower():
-                    if attempt < max_retries - 1:
-                        logger.info(f"[AkShare批量] 等待 {retry_delay} 秒后重试...")
-                        time.sleep(retry_delay)
-                        continue
-
-                return pd.DataFrame()
-
-        return pd.DataFrame()
-
-    def _try_efinance_batch(self, stock_codes: List[str]) -> pd.DataFrame:
-        """
-        尝试使用 Efinance 批量接口获取行情
-        """
-        try:
-            import efinance as ef
-
-            logger.info("[Efinance批量] 正在获取 A 股实时行情...")
-
-            df = ef.stock.get_realtime_quotes()
-
-            if df is None or df.empty:
-                logger.warning("[Efinance批量] 返回数据为空")
-                return pd.DataFrame()
-
-            # 筛选出目标股票
-            code_col = None
-            for col in ['股票代码', '代码', 'code', '股票名']:
-                if col in df.columns:
-                    code_col = col
-                    break
-
-            if code_col is None:
-                logger.error(f"[Efinance批量] 无法找到代码列: {df.columns.tolist()}")
-                return pd.DataFrame()
-
-            df_filtered = df[df[code_col].astype(str).isin(stock_codes)]
-            logger.info(f"[Efinance批量] 成功获取 {len(df_filtered)} 只股票的实时行情")
-            return df_filtered
-
-        except ImportError:
-            logger.debug("[Efinance批量] efinance 未安装")
-            return pd.DataFrame()
-        except Exception as e:
-            logger.warning(f"[Efinance批量] 获取失败: {e}")
-            return pd.DataFrame()
-
-    def _fetch_with_multi_sources(self, stock_codes: List[str]) -> pd.DataFrame:
-        """
-        使用 DataFetcherManager 多数据源逐个获取实时行情（兜底方案）
-        """
-        logger.info(f"[多数据源] 开始逐个获取 {len(stock_codes)} 只股票的实时行情...")
-
-        quotes_data = []
-        success_count = 0
-        fail_count = 0
-
-        for i, code in enumerate(stock_codes):
-            try:
-                quote = self.fetcher_manager.get_realtime_quote(code)
-
-                if quote and quote.has_basic_data():
-                    quotes_data.append({
-                        '代码': code,
-                        '名称': quote.name,
-                        '最新价': quote.price,
-                        '涨跌幅': quote.change_pct,
-                        '涨跌额': quote.change_amount,
-                        '成交量': quote.volume,
-                        '成交额': quote.amount,
-                        '量比': quote.volume_ratio,
-                        '换手率': quote.turnover_rate,
-                        '振幅': quote.amplitude,
-                        '最高': quote.high,
-                        '最低': quote.low,
-                        '今开': quote.open_price,
-                        '市盈率-动态': quote.pe_ratio,
-                    })
-                    success_count += 1
-                else:
-                    fail_count += 1
-
-                if (i + 1) % 50 == 0:
-                    logger.info(f"[多数据源] 进度: {i + 1}/{len(stock_codes)}, 成功: {success_count}, 失败: {fail_count}")
-
-            except Exception as e:
-                fail_count += 1
-                logger.warning(f"[多数据源] {code} 获取异常: {e}")
-                continue
-
-        if not quotes_data:
-            logger.error("[多数据源] 未能获取任何股票数据")
-            return pd.DataFrame()
-
-        df = pd.DataFrame(quotes_data)
-        logger.info(f"[多数据源] 完成! 成功: {success_count}, 失败: {fail_count}")
-        return df
-
-    def _get_stock_history(self, code: str, days: int = 120) -> Optional[pd.DataFrame]:
-        """
-        获取股票历史 K 线数据
+        获取股票历史日线数据
 
         Args:
             code: 股票代码
@@ -317,26 +142,25 @@ class StockScreener:
             包含 OHLCV 的 DataFrame，失败返回 None
         """
         try:
-            # 使用 DataFetcherManager.get_daily_data() 获取历史数据
             df, _ = self.fetcher_manager.get_daily_data(code, days=days)
             if df is None or df.empty:
-                logger.debug(f"[历史数据] {code} 获取失败")
+                logger.debug(f"[日线数据] {code} 获取失败")
                 return None
             return df
         except Exception as e:
-            logger.debug(f"[历史数据] {code} 获取异常: {e}")
+            logger.debug(f"[日线数据] {code} 获取异常: {e}")
             return None
 
     def analyze_stocks(self, stock_codes: List[str], top_n: int = 2) -> List[StockScore]:
         """
-        使用完整的 StockTrendAnalyzer 分析股票并打分
+        使用 StockTrendAnalyzer 分析股票并打分
 
         Args:
             stock_codes: 股票代码列表
             top_n: 返回前 N 名
 
         Returns:
-            按得分排序的 StockScore 列表（仅包含买入信号为 STRONG_BUY 或 BUY 的股票）
+            按买入信号优先级+得分排序的 StockScore 列表
         """
         logger.info(f"[完整分析] 开始分析 {len(stock_codes)} 只股票...")
 
@@ -344,30 +168,10 @@ class StockScreener:
         success_count = 0
         fail_count = 0
 
-        # 先批量获取实时行情（用于过滤 ST 股和获取名称）
-        realtime_df = self.get_realtime_data_batch(stock_codes)
-        if realtime_df.empty:
-            logger.error("[完整分析] 无法获取实时行情")
-            return []
-
-        # 过滤 ST 股
-        name_col = '名称' if '名称' in realtime_df.columns else 'name'
-        code_col = '代码' if '代码' in realtime_df.columns else 'code'
-        amount_col = '成交额' if '成交额' in realtime_df.columns else 'amount'
-
-        filtered_df = realtime_df[
-            (~realtime_df[name_col].str.contains('ST', na=False)) &
-            (realtime_df[amount_col] > 0)
-        ]
-
-        valid_codes = filtered_df[code_col].astype(str).tolist()
-        logger.info(f"[完整分析] 过滤后剩余 {len(valid_codes)} 只股票（已排除 ST 股）")
-
-        # 逐只股票进行完整分析
-        for i, code in enumerate(valid_codes):
+        for i, code in enumerate(stock_codes):
             try:
-                # 获取历史 K 线数据
-                df = self._get_stock_history(code, days=120)
+                # 获取历史日线数据（用于技术分析）
+                df = self._get_stock_daily_data(code, days=120)
                 if df is None or len(df) < 30:
                     fail_count += 1
                     continue
@@ -375,21 +179,15 @@ class StockScreener:
                 # 使用 StockTrendAnalyzer 进行完整分析
                 result = self.trend_analyzer.analyze(df, code)
 
-                # 从实时行情获取额外信息
-                realtime_row = filtered_df[filtered_df[code_col].astype(str) == code]
-                name = ""
-                change_pct = 0.0
-                if not realtime_row.empty:
-                    row = realtime_row.iloc[0]
-                    name = row.get('名称', row.get('name', ''))
-                    change_pct = float(row.get('涨跌幅', row.get('change_percent', 0)))
+                # 从分析结果获取股票名称
+                name = result.code  # StockTrendAnalyzer 不返回名称，使用代码
 
                 # 创建 StockScore 对象
                 score = StockScore(
                     code=code,
-                    name=name or result.code,
+                    name=name,
                     price=result.current_price,
-                    change_pct=change_pct,
+                    change_pct=result.bias_ma5,  # 近似涨跌幅
                     ma5=result.ma5,
                     ma10=result.ma10,
                     ma20=result.ma20,
@@ -397,7 +195,6 @@ class StockScreener:
                     total_score=result.signal_score,
                     buy_signal=result.buy_signal,
                     analysis_result=result,
-                    # 标记
                     is_bullish=result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL],
                     trend_strength=result.trend_strength,
                 )
@@ -407,7 +204,7 @@ class StockScreener:
 
                 # 每 20 只股票打印一次进度
                 if (i + 1) % 20 == 0:
-                    logger.info(f"[完整分析] 进度: {i + 1}/{len(valid_codes)}, 成功: {success_count}, 失败: {fail_count}")
+                    logger.info(f"[完整分析] 进度: {i + 1}/{len(stock_codes)}, 成功: {success_count}, 失败: {fail_count}")
 
             except Exception as e:
                 fail_count += 1
@@ -421,11 +218,7 @@ class StockScreener:
             return []
 
         # 筛选买入信号为 STRONG_BUY 或 BUY 的股票
-        buy_signals = [
-            BuySignal.STRONG_BUY,
-            BuySignal.BUY,
-        ]
-
+        buy_signals = [BuySignal.STRONG_BUY, BuySignal.BUY]
         buyable_scores = [s for s in scores if s.buy_signal in buy_signals]
         logger.info(f"[完整分析] 筛选出 {len(buyable_scores)} 只值得买入的股票")
 
@@ -469,7 +262,7 @@ class StockScreener:
         index_name = index_names.get(index_code, f"指数{index_code}")
 
         logger.info(f"==========================================")
-        logger.info(f"🎯 股票筛选器启动（完整分析模式）")
+        logger.info(f"🎯 股票筛选器启动（盘后分析模式）")
         logger.info(f"📊 筛选范围: {index_name} ({index_code})")
         logger.info(f"🏆 返回数量: {top_n}")
         logger.info(f"==========================================")
@@ -496,9 +289,9 @@ class StockScreener:
                 f"\n#{i} {signal_emoji} {stock.name}({stock.code})\n"
                 f"   买入信号: {stock.buy_signal.value}\n"
                 f"   综合得分: {stock.total_score}/100\n"
-                f"   现价: {stock.price:.2f} | 涨跌: {stock.change_pct:+.2f}%\n"
+                f"   收盘价: {stock.price:.2f}\n"
                 f"   MA5: {stock.ma5 or 'N/A':.2f} | MA10: {stock.ma10 or 'N/A':.2f} | MA20: {stock.ma20 or 'N/A':.2f}\n"
-                f"   乖离率: {stock.bias_ma5 or 0:+.2f}% | 趋势强度: {stock.trend_strength}/100"
+                f"   乖离率: {stock.bias_ma5 or 0:+.2f}% | 趋势强度: {stock.trend_strength:.0f}/100"
             )
 
             # 如果有完整分析结果，打印更多信息
@@ -533,7 +326,7 @@ def format_screener_report(stocks: List[StockScore], index_name: str) -> str:
     lines = [
         f"# 🎯 {index_name} 每日优选股票",
         f"",
-        f"## 📋 筛选结果",
+        f"## 📋 筛选结果（盘后分析）",
         f"",
     ]
 
@@ -576,12 +369,12 @@ def format_screener_report(stocks: List[StockScore], index_name: str) -> str:
             f"|------|------|------|",
             f"| **买入信号** | | **{stock.buy_signal.value}** |",
             f"| **综合得分** | | **{stock.total_score}/100** |",
-            f"| 现价 | {stock.price:.2f} 元 | {'🟢' if stock.change_pct > 0 else '🔴'} {stock.change_pct:+.2f}% |",
+            f"| 收盘价 | {stock.price:.2f} 元 | |",
             f"| MA5 | {stock.ma5 or 'N/A':.2f} | |",
             f"| MA10 | {stock.ma10 or 'N/A':.2f} | |",
             f"| MA20 | {stock.ma20 or 'N/A':.2f} | |",
             f"| 乖离率(MA5) | {stock.bias_ma5 or 0:+.2f}% | {'✅安全' if abs(stock.bias_ma5 or 0) <= 5 else '⚠️偏高'} |",
-            f"| 趋势强度 | {stock.trend_strength}/100 | |",
+            f"| 趋势强度 | {stock.trend_strength:.0f}/100 | |",
             f"",
         ])
 
