@@ -17,6 +17,11 @@
 - 理念5：风险排查（无重大利空）
 - 理念6：量价配合
 - 理念7：强势趋势股可适当放宽
+
+数据源策略：
+- 使用 DataFetcherManager 统一管理多数据源
+- 支持自动故障切换（akshare_em → efinance → tencent → sina）
+- 利用熔断器机制避免反复请求失败的数据源
 """
 
 import logging
@@ -25,6 +30,9 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 import akshare as ak
 import pandas as pd
+
+from data_provider import DataFetcherManager
+from data_provider.realtime_types import UnifiedRealtimeQuote
 
 logger = logging.getLogger(__name__)
 
@@ -72,13 +80,20 @@ class StockScore:
 
 
 class StockScreener:
-    """股票筛选器"""
+    """股票筛选器
+
+    使用 DataFetcherManager 统一管理多数据源，支持：
+    - 自动故障切换
+    - 熔断器保护
+    - 多数据源协同
+    """
 
     # 中证1000指数代码
     ZZ1000_INDEX = "000852"
 
     def __init__(self):
-        pass
+        """初始化筛选器，创建数据源管理器"""
+        self.fetcher_manager = DataFetcherManager()
 
     def get_index_constituents(self, index_code: str = ZZ1000_INDEX) -> List[str]:
         """
@@ -137,7 +152,11 @@ class StockScreener:
 
     def get_realtime_data_batch(self, stock_codes: List[str]) -> pd.DataFrame:
         """
-        批量获取实时行情数据（带重试机制）
+        批量获取实时行情数据（使用多数据源协同）
+
+        策略：
+        1. 先尝试 AkShare 批量接口（最快，但易被封禁）
+        2. 失败后使用 DataFetcherManager 逐个获取（支持故障切换）
 
         Args:
             stock_codes: 股票代码列表
@@ -145,14 +164,33 @@ class StockScreener:
         Returns:
             包含实时行情的 DataFrame
         """
-        max_retries = 3
-        retry_delay = 30
+        # 方案1: 尝试 AkShare 批量接口（快速）
+        df = self._try_akshare_batch(stock_codes)
+        if not df.empty:
+            return df
+
+        # 方案2: 使用 DataFetcherManager 逐个获取（可靠）
+        logger.info("AkShare 批量接口失败，切换到多数据源逐个获取模式...")
+        return self._fetch_with_multi_sources(stock_codes)
+
+    def _try_akshare_batch(self, stock_codes: List[str]) -> pd.DataFrame:
+        """
+        尝试使用 AkShare 批量接口获取行情（快速但易被封禁）
+
+        Args:
+            stock_codes: 股票代码列表
+
+        Returns:
+            包含实时行情的 DataFrame，失败返回空 DataFrame
+        """
+        max_retries = 2
+        retry_delay = 10
 
         for attempt in range(max_retries):
             try:
-                logger.info(f"正在获取 {len(stock_codes)} 只股票的实时行情... (尝试 {attempt + 1}/{max_retries})")
+                logger.info(f"[AkShare批量] 正在获取实时行情... (尝试 {attempt + 1}/{max_retries})")
 
-                # 使用 AkShare 获取A股实时行情（支持筛选）
+                # 使用 AkShare 获取A股实时行情
                 df = ak.stock_zh_a_spot_em()
 
                 # 筛选出目标股票
@@ -161,27 +199,101 @@ class StockScreener:
                 elif 'code' in df.columns:
                     df_filtered = df[df['code'].isin(stock_codes)]
                 else:
-                    logger.error(f"实时行情数据中没有代码字段: {df.columns.tolist()}")
+                    logger.error(f"[AkShare批量] 实时行情数据中没有代码字段: {df.columns.tolist()}")
                     return pd.DataFrame()
 
-                logger.info(f"成功获取 {len(df_filtered)} 只股票的实时行情")
+                logger.info(f"[AkShare批量] 成功获取 {len(df_filtered)} 只股票的实时行情")
                 return df_filtered
 
             except Exception as e:
                 error_msg = str(e)
-                logger.warning(f"获取实时行情失败 (尝试 {attempt + 1}/{max_retries}): {error_msg}")
+                logger.warning(f"[AkShare批量] 获取失败 (尝试 {attempt + 1}/{max_retries}): {error_msg}")
 
                 # 如果是连接问题且还有重试机会，等待后重试
                 if 'Connection' in error_msg or 'RemoteDisconnected' in error_msg:
                     if attempt < max_retries - 1:
-                        logger.info(f"等待 {retry_delay} 秒后重试...")
+                        logger.info(f"[AkShare批量] 等待 {retry_delay} 秒后重试...")
                         time.sleep(retry_delay)
                         continue
 
-                logger.error(f"获取实时行情失败: {e}")
                 return pd.DataFrame()
 
         return pd.DataFrame()
+
+    def _fetch_with_multi_sources(self, stock_codes: List[str]) -> pd.DataFrame:
+        """
+        使用 DataFetcherManager 多数据源逐个获取实时行情
+
+        优势：
+        - 自动故障切换（akshare_em → efinance → tencent → sina）
+        - 熔断器保护，避免反复请求失败的数据源
+        - 缓存机制，减少重复请求
+
+        Args:
+            stock_codes: 股票代码列表
+
+        Returns:
+            包含实时行情的 DataFrame
+        """
+        logger.info(f"[多数据源] 开始逐个获取 {len(stock_codes)} 只股票的实时行情...")
+
+        # 先预取，触发全量数据缓存
+        prefetched = self.fetcher_manager.prefetch_realtime_quotes(stock_codes)
+        if prefetched > 0:
+            logger.info(f"[多数据源] 预取完成，已缓存 {prefetched} 只股票数据")
+
+        quotes_data = []
+        success_count = 0
+        fail_count = 0
+
+        for i, code in enumerate(stock_codes):
+            try:
+                # 使用 DataFetcherManager 获取实时行情（自动故障切换）
+                quote = self.fetcher_manager.get_realtime_quote(code)
+
+                if quote and quote.has_basic_data():
+                    quotes_data.append({
+                        '代码': code,
+                        '名称': quote.name,
+                        '最新价': quote.price,
+                        '涨跌幅': quote.change_pct,
+                        '涨跌额': quote.change_amount,
+                        '成交量': quote.volume,
+                        '成交额': quote.amount,
+                        '量比': quote.volume_ratio,
+                        '换手率': quote.turnover_rate,
+                        '振幅': quote.amplitude,
+                        '最高': quote.high,
+                        '最低': quote.low,
+                        '今开': quote.open_price,
+                        '市盈率-动态': quote.pe_ratio,
+                        '_source': quote.source.value,  # 记录数据来源
+                    })
+                    success_count += 1
+                else:
+                    fail_count += 1
+                    logger.debug(f"[多数据源] {code} 获取失败或数据不完整")
+
+                # 每 50 只股票打印一次进度
+                if (i + 1) % 50 == 0:
+                    logger.info(f"[多数据源] 进度: {i + 1}/{len(stock_codes)}, 成功: {success_count}, 失败: {fail_count}")
+
+                # 添加小延迟，避免请求过快
+                time.sleep(0.1)
+
+            except Exception as e:
+                fail_count += 1
+                logger.warning(f"[多数据源] {code} 获取异常: {e}")
+                continue
+
+        if not quotes_data:
+            logger.error("[多数据源] 未能获取任何股票数据")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(quotes_data)
+        logger.info(f"[多数据源] 完成! 成功: {success_count}, 失败: {fail_count}")
+
+        return df
 
     def calculate_stock_scores(self, stock_codes: List[str], top_n: int = 10) -> List[StockScore]:
         """
