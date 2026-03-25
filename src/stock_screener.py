@@ -5,41 +5,43 @@
 ===================================
 
 职责：
-1. 获取指数成分股（中证1000等）
-2. 基于核心交易理念进行多维度筛选
-3. 输出优质股票候选列表
+1. 获取指数成分股（沪深300/中证500等）
+2. 使用 StockTrendAnalyzer 完整打分逻辑进行评分
+3. 输出最值得买入的股票候选列表
 
-核心筛选标准（基于项目7条交易理念）：
-- 理念1：严进策略（乖离率 < 5%）
-- 理念2：趋势交易（MA5 > MA10 > MA20 多头排列）
-- 理念3：效率优先（筹码集中度 < 15%）
-- 理念4：买点偏好（回踩支撑而非追高）
-- 理念5：风险排查（无重大利空）
-- 理念6：量价配合
-- 理念7：强势趋势股可适当放宽
+筛选逻辑：
+- 使用完整的 StockTrendAnalyzer 打分系统（趋势+乖离率+量能+MACD+RSI+支撑）
+- 只返回买入信号为 STRONG_BUY 或 BUY 的股票
+- 按得分从高到低排序
 
 数据源策略：
 - 使用 DataFetcherManager 统一管理多数据源
 - 支持自动故障切换（akshare_em → efinance → tencent → sina）
-- 利用熔断器机制避免反复请求失败的数据源
 """
 
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 import akshare as ak
 import pandas as pd
 
 from data_provider import DataFetcherManager
-from data_provider.realtime_types import UnifiedRealtimeQuote
+
+# 导入完整的趋势分析器
+from src.stock_analyzer import (
+    StockTrendAnalyzer,
+    TrendAnalysisResult,
+    TrendStatus,
+    BuySignal,
+)
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class StockScore:
-    """股票评分数据类"""
+    """股票评分数据类（兼容旧代码）"""
     code: str
     name: str
     price: float
@@ -54,62 +56,53 @@ class StockScore:
     pe_ratio: Optional[float] = None
 
     # 筛选条件得分
-    bullish_alignment: int = 0      # 多头排列得分 (0/1)
-    bias_safe: int = 0              # 乖离率安全得分 (0/1)
-    volume_valid: int = 0           # 量能配合得分 (0/1)
-    chip_healthy: int = 0           # 筹码健康得分 (0/1)
-    trend_strength: int = 0          # 趋势强度 (0-100)
-    total_score: int = 0            # 综合得分
+    bullish_alignment: int = 0
+    bias_safe: int = 0
+    volume_valid: int = 0
+    chip_healthy: int = 0
+    trend_strength: float = 0.0  # 改为 float，与 TrendAnalysisResult 一致
+    total_score: int = 0
 
     # 标记
-    is_bullish: bool = False         # 是否多头排列
-    is_strong_trend: bool = False   # 是否强势趋势
+    is_bullish: bool = False
+    is_strong_trend: bool = False
 
-    def __post_init__(self):
-        """计算综合得分"""
-        # 基础分：满足每个条件得20分
-        base_score = (
-            self.bullish_alignment * 20 +
-            self.bias_safe * 20 +
-            self.volume_valid * 20 +
-            self.chip_healthy * 20
-        )
-        # 趋势强度加分（0-40分）
-        strength_score = self.trend_strength * 0.4
-        self.total_score = int(base_score + strength_score)
+    # 新增：完整的分析结果
+    analysis_result: Optional[TrendAnalysisResult] = None
+    buy_signal: BuySignal = BuySignal.WAIT
 
 
 class StockScreener:
     """股票筛选器
 
-    使用 DataFetcherManager 统一管理多数据源，支持：
-    - 自动故障切换
-    - 熔断器保护
-    - 多数据源协同
+    使用 StockTrendAnalyzer 完整打分逻辑，筛选最值得买入的股票。
+
+    筛选条件：
+    1. 买入信号为 STRONG_BUY 或 BUY
+    2. 按得分从高到低排序
     """
 
-    # 中证1000指数代码
-    ZZ1000_INDEX = "000852"
+    # 指数代码映射
+    ZZ1000_INDEX = "000852"  # 中证1000
 
     def __init__(self):
-        """初始化筛选器，创建数据源管理器"""
+        """初始化筛选器"""
         self.fetcher_manager = DataFetcherManager()
+        self.trend_analyzer = StockTrendAnalyzer()
 
     def get_index_constituents(self, index_code: str = ZZ1000_INDEX) -> List[str]:
         """
         获取指数成分股代码列表
 
         Args:
-            index_code: 指数代码，默认中证1000 (000852)
+            index_code: 指数代码
 
         Returns:
             成分股代码列表
         """
         try:
-            # AkShare 获取指数成分股
             logger.info(f"正在获取指数 {index_code} 成分股...")
 
-            # 尝试多种 AkShare 接口
             df = None
 
             # 方法1: 使用 ak.index_stock_cons()
@@ -132,7 +125,6 @@ class StockScreener:
                 return []
 
             # 提取股票代码
-            # AkShare index_stock_cons 返回字段: 品种代码, 品种名称, 纳入日期
             if '品种代码' in df.columns:
                 codes = df['品种代码'].tolist()
             elif '股票代码' in df.columns:
@@ -154,9 +146,10 @@ class StockScreener:
         """
         批量获取实时行情数据（使用多数据源协同）
 
-        策略：
-        1. 先尝试 AkShare 批量接口（最快，但易被封禁）
-        2. 失败后使用 DataFetcherManager 逐个获取（支持故障切换）
+        策略（按优先级）：
+        1. AkShare 批量接口（stock_zh_a_spot_em）- 一次请求获取全部 A 股
+        2. Efinance 批量接口 - 备选
+        3. DataFetcherManager 逐个获取 - 兜底
 
         Args:
             stock_codes: 股票代码列表
@@ -164,44 +157,49 @@ class StockScreener:
         Returns:
             包含实时行情的 DataFrame
         """
-        # 方案1: 尝试 AkShare 批量接口（快速）
+        # 方案1: 尝试 AkShare 批量接口（一次请求获取全部，最快）
         df = self._try_akshare_batch(stock_codes)
         if not df.empty:
             return df
 
-        # 方案2: 使用 DataFetcherManager 逐个获取（可靠）
-        logger.info("AkShare 批量接口失败，切换到多数据源逐个获取模式...")
+        # 方案2: 尝试 Efinance 批量接口
+        df = self._try_efinance_batch(stock_codes)
+        if not df.empty:
+            return df
+
+        # 方案3: 使用 DataFetcherManager 逐个获取（可靠但较慢）
+        logger.info("批量接口全部失败，切换到逐个获取模式（可能较慢）...")
         return self._fetch_with_multi_sources(stock_codes)
 
     def _try_akshare_batch(self, stock_codes: List[str]) -> pd.DataFrame:
         """
-        尝试使用 AkShare 批量接口获取行情（快速但易被封禁）
-
-        Args:
-            stock_codes: 股票代码列表
-
-        Returns:
-            包含实时行情的 DataFrame，失败返回空 DataFrame
+        尝试使用 AkShare 批量接口获取行情（一次请求获取全部 A 股，最快）
         """
         max_retries = 2
         retry_delay = 10
 
         for attempt in range(max_retries):
             try:
-                logger.info(f"[AkShare批量] 正在获取实时行情... (尝试 {attempt + 1}/{max_retries})")
+                logger.info(f"[AkShare批量] 正在获取 A 股实时行情... (尝试 {attempt + 1}/{max_retries})")
 
-                # 使用 AkShare 获取A股实时行情
                 df = ak.stock_zh_a_spot_em()
 
+                if df is None or df.empty:
+                    logger.warning(f"[AkShare批量] 返回数据为空 (尝试 {attempt + 1}/{max_retries})")
+                    continue
+
                 # 筛选出目标股票
-                if '代码' in df.columns:
-                    df_filtered = df[df['代码'].isin(stock_codes)]
-                elif 'code' in df.columns:
-                    df_filtered = df[df['code'].isin(stock_codes)]
-                else:
+                code_col = None
+                for col in ['代码', 'code', '股票代码']:
+                    if col in df.columns:
+                        code_col = col
+                        break
+
+                if code_col is None:
                     logger.error(f"[AkShare批量] 实时行情数据中没有代码字段: {df.columns.tolist()}")
                     return pd.DataFrame()
 
+                df_filtered = df[df[code_col].astype(str).isin(stock_codes)]
                 logger.info(f"[AkShare批量] 成功获取 {len(df_filtered)} 只股票的实时行情")
                 return df_filtered
 
@@ -209,8 +207,7 @@ class StockScreener:
                 error_msg = str(e)
                 logger.warning(f"[AkShare批量] 获取失败 (尝试 {attempt + 1}/{max_retries}): {error_msg}")
 
-                # 如果是连接问题且还有重试机会，等待后重试
-                if 'Connection' in error_msg or 'RemoteDisconnected' in error_msg:
+                if 'Connection' in error_msg or 'RemoteDisconnected' in error_msg or 'timeout' in error_msg.lower():
                     if attempt < max_retries - 1:
                         logger.info(f"[AkShare批量] 等待 {retry_delay} 秒后重试...")
                         time.sleep(retry_delay)
@@ -220,27 +217,48 @@ class StockScreener:
 
         return pd.DataFrame()
 
+    def _try_efinance_batch(self, stock_codes: List[str]) -> pd.DataFrame:
+        """
+        尝试使用 Efinance 批量接口获取行情
+        """
+        try:
+            import efinance as ef
+
+            logger.info("[Efinance批量] 正在获取 A 股实时行情...")
+
+            df = ef.stock.get_realtime_quotes()
+
+            if df is None or df.empty:
+                logger.warning("[Efinance批量] 返回数据为空")
+                return pd.DataFrame()
+
+            # 筛选出目标股票
+            code_col = None
+            for col in ['股票代码', '代码', 'code', '股票名']:
+                if col in df.columns:
+                    code_col = col
+                    break
+
+            if code_col is None:
+                logger.error(f"[Efinance批量] 无法找到代码列: {df.columns.tolist()}")
+                return pd.DataFrame()
+
+            df_filtered = df[df[code_col].astype(str).isin(stock_codes)]
+            logger.info(f"[Efinance批量] 成功获取 {len(df_filtered)} 只股票的实时行情")
+            return df_filtered
+
+        except ImportError:
+            logger.debug("[Efinance批量] efinance 未安装")
+            return pd.DataFrame()
+        except Exception as e:
+            logger.warning(f"[Efinance批量] 获取失败: {e}")
+            return pd.DataFrame()
+
     def _fetch_with_multi_sources(self, stock_codes: List[str]) -> pd.DataFrame:
         """
-        使用 DataFetcherManager 多数据源逐个获取实时行情
-
-        优势：
-        - 自动故障切换（akshare_em → efinance → tencent → sina）
-        - 熔断器保护，避免反复请求失败的数据源
-        - 缓存机制，减少重复请求
-
-        Args:
-            stock_codes: 股票代码列表
-
-        Returns:
-            包含实时行情的 DataFrame
+        使用 DataFetcherManager 多数据源逐个获取实时行情（兜底方案）
         """
         logger.info(f"[多数据源] 开始逐个获取 {len(stock_codes)} 只股票的实时行情...")
-
-        # 先预取，触发全量数据缓存
-        prefetched = self.fetcher_manager.prefetch_realtime_quotes(stock_codes)
-        if prefetched > 0:
-            logger.info(f"[多数据源] 预取完成，已缓存 {prefetched} 只股票数据")
 
         quotes_data = []
         success_count = 0
@@ -248,7 +266,6 @@ class StockScreener:
 
         for i, code in enumerate(stock_codes):
             try:
-                # 使用 DataFetcherManager 获取实时行情（自动故障切换）
                 quote = self.fetcher_manager.get_realtime_quote(code)
 
                 if quote and quote.has_basic_data():
@@ -267,19 +284,13 @@ class StockScreener:
                         '最低': quote.low,
                         '今开': quote.open_price,
                         '市盈率-动态': quote.pe_ratio,
-                        '_source': quote.source.value,  # 记录数据来源
                     })
                     success_count += 1
                 else:
                     fail_count += 1
-                    logger.debug(f"[多数据源] {code} 获取失败或数据不完整")
 
-                # 每 50 只股票打印一次进度
                 if (i + 1) % 50 == 0:
                     logger.info(f"[多数据源] 进度: {i + 1}/{len(stock_codes)}, 成功: {success_count}, 失败: {fail_count}")
-
-                # 添加小延迟，避免请求过快
-                time.sleep(0.1)
 
             except Exception as e:
                 fail_count += 1
@@ -292,142 +303,146 @@ class StockScreener:
 
         df = pd.DataFrame(quotes_data)
         logger.info(f"[多数据源] 完成! 成功: {success_count}, 失败: {fail_count}")
-
         return df
 
-    def calculate_stock_scores(self, stock_codes: List[str], top_n: int = 10) -> List[StockScore]:
+    def _get_stock_history(self, code: str, days: int = 120) -> Optional[pd.DataFrame]:
         """
-        计算股票筛选得分
+        获取股票历史 K 线数据
+
+        Args:
+            code: 股票代码
+            days: 获取天数
+
+        Returns:
+            包含 OHLCV 的 DataFrame，失败返回 None
+        """
+        try:
+            # 使用 DataFetcherManager.get_daily_data() 获取历史数据
+            df, _ = self.fetcher_manager.get_daily_data(code, days=days)
+            if df is None or df.empty:
+                logger.debug(f"[历史数据] {code} 获取失败")
+                return None
+            return df
+        except Exception as e:
+            logger.debug(f"[历史数据] {code} 获取异常: {e}")
+            return None
+
+    def analyze_stocks(self, stock_codes: List[str], top_n: int = 2) -> List[StockScore]:
+        """
+        使用完整的 StockTrendAnalyzer 分析股票并打分
 
         Args:
             stock_codes: 股票代码列表
             top_n: 返回前 N 名
 
         Returns:
-            按得分排序的 StockScore 列表
+            按得分排序的 StockScore 列表（仅包含买入信号为 STRONG_BUY 或 BUY 的股票）
         """
-        # 获取实时行情
-        realtime_df = self.get_realtime_data_batch(stock_codes)
-        if realtime_df.empty:
-            logger.error("无法获取实时行情，无法进行筛选")
-            return []
+        logger.info(f"[完整分析] 开始分析 {len(stock_codes)} 只股票...")
 
         scores = []
+        success_count = 0
+        fail_count = 0
 
-        for idx, row in realtime_df.iterrows():
+        # 先批量获取实时行情（用于过滤 ST 股和获取名称）
+        realtime_df = self.get_realtime_data_batch(stock_codes)
+        if realtime_df.empty:
+            logger.error("[完整分析] 无法获取实时行情")
+            return []
+
+        # 过滤 ST 股
+        name_col = '名称' if '名称' in realtime_df.columns else 'name'
+        code_col = '代码' if '代码' in realtime_df.columns else 'code'
+        amount_col = '成交额' if '成交额' in realtime_df.columns else 'amount'
+
+        filtered_df = realtime_df[
+            (~realtime_df[name_col].str.contains('ST', na=False)) &
+            (realtime_df[amount_col] > 0)
+        ]
+
+        valid_codes = filtered_df[code_col].astype(str).tolist()
+        logger.info(f"[完整分析] 过滤后剩余 {len(valid_codes)} 只股票（已排除 ST 股）")
+
+        # 逐只股票进行完整分析
+        for i, code in enumerate(valid_codes):
             try:
-                # 提取数据
-                code = row.get('代码', row.get('code', ''))
-                name = row.get('名称', row.get('name', ''))
-                price = float(row.get('最新价', row.get('price', 0)))
-                change_pct = float(row.get('涨跌幅', row.get('change_percent', 0)))
-                ma5 = row.get('MA5') or row.get('ma5')
-                ma10 = row.get('MA10') or row.get('ma10')
-                ma20 = row.get('MA20') or row.get('ma20')
-                volume_ratio = row.get('量比') or row.get('volume_ratio')
-                turnover_rate = row.get('换手率') or row.get('turnover_rate')
-                pe_ratio = row.get('市盈率-动态') or row.get('pe_ratio')
+                # 获取历史 K 线数据
+                df = self._get_stock_history(code, days=120)
+                if df is None or len(df) < 30:
+                    fail_count += 1
+                    continue
 
-                # 转换 MA 值
-                if ma5:
-                    try:
-                        ma5 = float(ma5)
-                    except:
-                        ma5 = None
-                if ma10:
-                    try:
-                        ma10 = float(ma10)
-                    except:
-                        ma10 = None
-                if ma20:
-                    try:
-                        ma20 = float(ma20)
-                    except:
-                        ma20 = None
+                # 使用 StockTrendAnalyzer 进行完整分析
+                result = self.trend_analyzer.analyze(df, code)
 
-                # 计算乖离率
-                bias_ma5 = 0.0
-                if ma5 and ma5 > 0:
-                    bias_ma5 = (price - ma5) / ma5 * 100
+                # 从实时行情获取额外信息
+                realtime_row = filtered_df[filtered_df[code_col].astype(str) == code]
+                name = ""
+                change_pct = 0.0
+                if not realtime_row.empty:
+                    row = realtime_row.iloc[0]
+                    name = row.get('名称', row.get('name', ''))
+                    change_pct = float(row.get('涨跌幅', row.get('change_percent', 0)))
 
-                # 判断多头排列
-                is_bullish = False
-                if ma5 and ma10 and ma20:
-                    is_bullish = ma5 > ma10 > ma20
-
-                # 趋势强度（基于均线间距）
-                trend_strength = 0
-                if ma5 and ma10 and ma20:
-                    # 均线间距比例
-                    spacing1 = (ma5 - ma10) / ma10 if ma10 > 0 else 0
-                    spacing2 = (ma10 - ma20) / ma20 if ma20 > 0 else 0
-                    trend_strength = int(min((spacing1 + spacing2) * 1000, 100))
-
-                # 筛选条件判断
-                bullish_alignment = 1 if is_bullish else 0
-
-                # 乖离率安全：<= 5%
-                bias_safe = 1 if abs(bias_ma5) <= 5 else 0
-
-                # 强势趋势股放宽标准
-                is_strong_trend = is_bullish and trend_strength > 60
-                bias_safe_strict = 1 if abs(bias_ma5) <= 2 else 0
-
-                # 使用宽松标准还是严格标准
-                effective_bias_safe = bias_safe_strict if is_strong_trend else bias_safe
-
-                # 量能配合：量比 0.8-3 为正常
-                volume_valid = 0
-                if volume_ratio:
-                    try:
-                        vr = float(volume_ratio)
-                        volume_valid = 1 if 0.8 <= vr <= 3 else 0
-                    except:
-                        pass
-
-                # 筹码健康：换手率适中 (1-5%)
-                chip_healthy = 0
-                if turnover_rate:
-                    try:
-                        tr = float(turnover_rate)
-                        # 换手率 1-5% 为健康
-                        chip_healthy = 1 if 1 <= tr <= 5 else 0
-                    except:
-                        pass
-
-                # 创建评分对象
+                # 创建 StockScore 对象
                 score = StockScore(
                     code=code,
-                    name=name,
-                    price=price,
+                    name=name or result.code,
+                    price=result.current_price,
                     change_pct=change_pct,
-                    ma5=ma5,
-                    ma10=ma10,
-                    ma20=ma20,
-                    bias_ma5=bias_ma5,
-                    volume_ratio=volume_ratio,
-                    turnover_rate=turnover_rate,
-                    pe_ratio=pe_ratio,
-                    bullish_alignment=bullish_alignment,
-                    bias_safe=effective_bias_safe,
-                    volume_valid=volume_valid,
-                    chip_healthy=chip_healthy,
-                    trend_strength=trend_strength,
-                    is_bullish=is_bullish,
-                    is_strong_trend=is_strong_trend,
+                    ma5=result.ma5,
+                    ma10=result.ma10,
+                    ma20=result.ma20,
+                    bias_ma5=result.bias_ma5,
+                    total_score=result.signal_score,
+                    buy_signal=result.buy_signal,
+                    analysis_result=result,
+                    # 标记
+                    is_bullish=result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL],
+                    trend_strength=result.trend_strength,
                 )
 
                 scores.append(score)
+                success_count += 1
+
+                # 每 20 只股票打印一次进度
+                if (i + 1) % 20 == 0:
+                    logger.info(f"[完整分析] 进度: {i + 1}/{len(valid_codes)}, 成功: {success_count}, 失败: {fail_count}")
 
             except Exception as e:
-                logger.warning(f"处理股票 {row.get('代码', '')} 评分时出错: {e}")
+                fail_count += 1
+                logger.debug(f"[完整分析] {code} 分析异常: {e}")
                 continue
 
-        # 按得分排序
-        scores_sorted = sorted(scores, key=lambda x: x.total_score, reverse=True)
-        logger.info(f"完成 {len(scores)} 只股票评分，最高分: {scores_sorted[0].total_score if scores_sorted else 0}")
+        logger.info(f"[完整分析] 完成! 成功: {success_count}, 失败: {fail_count}")
 
-        return scores_sorted[:top_n]
+        if not scores:
+            logger.warning("[完整分析] 未能分析任何股票")
+            return []
+
+        # 筛选买入信号为 STRONG_BUY 或 BUY 的股票
+        buy_signals = [
+            BuySignal.STRONG_BUY,
+            BuySignal.BUY,
+        ]
+
+        buyable_scores = [s for s in scores if s.buy_signal in buy_signals]
+        logger.info(f"[完整分析] 筛选出 {len(buyable_scores)} 只值得买入的股票")
+
+        if not buyable_scores:
+            logger.warning("[完整分析] 没有股票满足买入条件")
+            # 如果没有买入信号，返回得分最高的几只（但标记为不推荐）
+            scores_sorted = sorted(scores, key=lambda x: x.total_score, reverse=True)
+            return scores_sorted[:top_n]
+
+        # 按买入信号优先级 + 得分排序
+        # STRONG_BUY 优先于 BUY，同级别按得分排序
+        def sort_key(s: StockScore):
+            signal_priority = 0 if s.buy_signal == BuySignal.STRONG_BUY else 1
+            return (signal_priority, -s.total_score)
+
+        buyable_scores.sort(key=sort_key)
+        return buyable_scores[:top_n]
 
     def screen(self, index_code: Optional[str] = None, top_n: int = 2) -> Tuple[List[StockScore], str]:
         """
@@ -438,7 +453,7 @@ class StockScreener:
             top_n: 返回前 N 名
 
         Returns:
-            (筛选结果, 索引名称)
+            (筛选结果, 指数名称)
         """
         if index_code is None:
             index_code = self.ZZ1000_INDEX
@@ -454,7 +469,7 @@ class StockScreener:
         index_name = index_names.get(index_code, f"指数{index_code}")
 
         logger.info(f"==========================================")
-        logger.info(f"🎯 股票筛选器启动")
+        logger.info(f"🎯 股票筛选器启动（完整分析模式）")
         logger.info(f"📊 筛选范围: {index_name} ({index_code})")
         logger.info(f"🏆 返回数量: {top_n}")
         logger.info(f"==========================================")
@@ -467,51 +482,35 @@ class StockScreener:
 
         logger.info(f"开始从 {len(stock_codes)} 只成分股中筛选...")
 
-        # 延迟30秒，避免高频请求
-        logger.info("等待 30 秒后获取实时行情（避免高频请求）...")
-        time.sleep(30)
+        # 2. 使用完整分析模式进行筛选
+        top_stocks = self.analyze_stocks(stock_codes, top_n=top_n)
 
-        # 2. 初筛：过滤 ST 股、停牌股等
-        logger.info("执行初筛：过滤 ST 股、停牌股...")
-        realtime_df = self.get_realtime_data_batch(stock_codes)
-        if realtime_df.empty:
-            return [], index_name
-
-        # 过滤条件：
-        # - 名称不含 ST
-        # - 涨跌幅在合理范围内（非异常）
-        # - 成交额不为0
-        name_col = '名称' if '名称' in realtime_df.columns else 'name'
-        code_col = '代码' if '代码' in realtime_df.columns else 'code'
-        amount_col = '成交额' if '成交额' in realtime_df.columns else 'amount'
-
-        filtered_df = realtime_df[
-            (~realtime_df[name_col].str.contains('ST', na=False)) &
-            (realtime_df[amount_col] > 0) &
-            (realtime_df[code_col].astype(str).str.len() == 6)  # 过滤掉非6位代码
-        ]
-
-        filtered_codes = filtered_df[code_col].tolist()
-        logger.info(f"初筛后剩余: {len(filtered_codes)} 只股票")
-
-        # 3. 计算得分并排序
-        top_stocks = self.calculate_stock_scores(filtered_codes, top_n=min(top_n * 2, 20))
-
-        # 4. 输出结果
+        # 3. 输出结果
         logger.info(f"\n==========================================")
         logger.info(f"📋 筛选结果 TOP {len(top_stocks)}")
         logger.info(f"==========================================")
-        for i, stock in enumerate(top_stocks[:top_n], 1):
+
+        for i, stock in enumerate(top_stocks, 1):
+            signal_emoji = "🔥" if stock.buy_signal == BuySignal.STRONG_BUY else "✅"
             logger.info(
-                f"\n#{i} {stock.name}({stock.code})\n"
+                f"\n#{i} {signal_emoji} {stock.name}({stock.code})\n"
+                f"   买入信号: {stock.buy_signal.value}\n"
+                f"   综合得分: {stock.total_score}/100\n"
                 f"   现价: {stock.price:.2f} | 涨跌: {stock.change_pct:+.2f}%\n"
                 f"   MA5: {stock.ma5 or 'N/A':.2f} | MA10: {stock.ma10 or 'N/A':.2f} | MA20: {stock.ma20 or 'N/A':.2f}\n"
-                f"   乖离率: {stock.bias_ma5:+.2f}% | 量比: {stock.volume_ratio or 'N/A'} | 换手率: {stock.turnover_rate or 'N/A'}%\n"
-                f"   多头排列: {'✅' if stock.is_bullish else '❌'} | 筹码健康: {'✅' if stock.chip_healthy else '❌'}\n"
-                f"   综合得分: {stock.total_score}"
+                f"   乖离率: {stock.bias_ma5 or 0:+.2f}% | 趋势强度: {stock.trend_strength}/100"
             )
 
-        return top_stocks[:top_n], index_name
+            # 如果有完整分析结果，打印更多信息
+            if stock.analysis_result:
+                result = stock.analysis_result
+                logger.info(f"   MACD: {result.macd_status.value} | RSI: {result.rsi_status.value}")
+                if result.signal_reasons:
+                    logger.info(f"   买入理由: {'; '.join(result.signal_reasons[:3])}")
+                if result.risk_factors:
+                    logger.info(f"   风险提示: {'; '.join(result.risk_factors[:2])}")
+
+        return top_stocks, index_name
 
 
 def format_screener_report(stocks: List[StockScore], index_name: str) -> str:
@@ -520,7 +519,7 @@ def format_screener_report(stocks: List[StockScore], index_name: str) -> str:
 
     Args:
         stocks: 筛选出的股票列表
-        index_name: 索引名称
+        index_name: 指数名称
 
     Returns:
         Markdown 格式的报告
@@ -528,47 +527,100 @@ def format_screener_report(stocks: List[StockScore], index_name: str) -> str:
     if not stocks:
         return f"# 📊 {index_name} 筛选结果\n\n未筛选出符合条件的股票。"
 
+    # 检查是否有买入信号
+    has_buy_signal = any(s.buy_signal in [BuySignal.STRONG_BUY, BuySignal.BUY] for s in stocks)
+
     lines = [
         f"# 🎯 {index_name} 每日优选股票",
         f"",
         f"## 📋 筛选结果",
         f"",
-        f"基于以下核心交易理念筛选：",
-        f"- ✅ 趋势交易：MA5 > MA10 > MA20 多头排列",
-        f"- ✅ 严进策略：乖离率 < 5%（强势股可放宽至 8%）",
-        f"- ✅ 效率优先：换手率 1-5%",
-        f"- ✅ 量价配合：量比 0.8-3",
-        f"",
-        f"---",
-        f""
     ]
 
-    for i, stock in enumerate(stocks, 1):
+    if has_buy_signal:
         lines.extend([
-            f"### #{i} {stock.name}({stock.code})",
+            f"**使用完整的 StockTrendAnalyzer 打分系统（100分制）**",
+            f"",
+            f"评分维度：",
+            f"- 趋势（30分）：均线排列状态",
+            f"- 乖离率（20分）：价格与MA5偏离度",
+            f"- 量能（15分）：量价配合程度",
+            f"- MACD（15分）：金叉/死叉/多空状态",
+            f"- RSI（10分）：超买/超卖/强势",
+            f"- 支撑（10分）：均线支撑有效性",
+            f"",
+            f"**买入信号说明：**",
+            f"- 🔥 强烈买入：得分≥75 + 多头排列",
+            f"- ✅ 买入：得分≥60 + 多头/弱多头",
+            f"",
+            f"---",
+            f"",
+        ])
+    else:
+        lines.extend([
+            f"⚠️ **今日没有股票满足买入条件**",
+            f"",
+            f"以下为得分最高的股票（仅供参考）：",
+            f"",
+            f"---",
+            f"",
+        ])
+
+    for i, stock in enumerate(stocks, 1):
+        signal_emoji = "🔥" if stock.buy_signal == BuySignal.STRONG_BUY else "✅" if stock.buy_signal == BuySignal.BUY else "⏸️"
+
+        lines.extend([
+            f"### #{i} {signal_emoji} {stock.name}({stock.code})",
             f"",
             f"| 指标 | 数值 | 状态 |",
             f"|------|------|------|",
-            f"| 现价 | {stock.price:.2f} 元 | |",
-            f"| 涨跌幅 | {stock.change_pct:+.2f}% | {'🟢' if stock.change_pct > 0 else '🔴'} |",
+            f"| **买入信号** | | **{stock.buy_signal.value}** |",
+            f"| **综合得分** | | **{stock.total_score}/100** |",
+            f"| 现价 | {stock.price:.2f} 元 | {'🟢' if stock.change_pct > 0 else '🔴'} {stock.change_pct:+.2f}% |",
             f"| MA5 | {stock.ma5 or 'N/A':.2f} | |",
             f"| MA10 | {stock.ma10 or 'N/A':.2f} | |",
             f"| MA20 | {stock.ma20 or 'N/A':.2f} | |",
-            f"| 乖离率(MA5) | {stock.bias_ma5:+.2f}% | {'✅安全' if abs(stock.bias_ma5) <= 5 else '⚠️追高'} |",
-            f"| 量比 | {stock.volume_ratio or 'N/A'} | {'✅配合' if 0.8 <= (stock.volume_ratio or 0) <= 3 else '❌异常'} |",
-            f"| 换手率 | {stock.turnover_rate or 'N/A'}% | {'✅健康' if 1 <= (stock.turnover_rate or 0) <= 5 else '❌异常'} |",
-            f"| 多头排列 | | {'✅' if stock.is_bullish else '❌'} |",
-            f"| 综合得分 | | **{stock.total_score}** |",
+            f"| 乖离率(MA5) | {stock.bias_ma5 or 0:+.2f}% | {'✅安全' if abs(stock.bias_ma5 or 0) <= 5 else '⚠️偏高'} |",
+            f"| 趋势强度 | {stock.trend_strength}/100 | |",
             f"",
-            f"**筛选标准满足情况：**",
-            f"- 多头排列: {'✅' if stock.bullish_alignment else '❌'}",
-            f"- 乖离率安全: {'✅' if stock.bias_safe else '❌'}",
-            f"- 量能配合: {'✅' if stock.volume_valid else '❌'}",
-            f"- 筹码健康: {'✅' if stock.chip_healthy else '❌'}",
-            f"",
-            f"---",
-            f""
         ])
+
+        # 如果有完整分析结果，添加更多信息
+        if stock.analysis_result:
+            result = stock.analysis_result
+            lines.extend([
+                f"**技术指标：**",
+                f"- 趋势状态: {result.trend_status.value}",
+                f"- MACD: {result.macd_status.value}",
+                f"- RSI: {result.rsi_status.value}",
+                f"- 量能: {result.volume_status.value}",
+                f"",
+            ])
+
+            if result.signal_reasons:
+                lines.append(f"**买入理由：**")
+                for reason in result.signal_reasons[:5]:
+                    lines.append(f"- {reason}")
+                lines.append(f"")
+
+            if result.risk_factors:
+                lines.append(f"**风险提示：**")
+                for risk in result.risk_factors[:3]:
+                    lines.append(f"- {risk}")
+                lines.append(f"")
+
+        lines.extend([
+            f"---",
+            f"",
+        ])
+
+    # 添加免责声明
+    lines.extend([
+        f"## ⚠️ 免责声明",
+        f"",
+        f"本报告仅供参考，不构成投资建议。股市有风险，投资需谨慎。",
+        f"",
+    ])
 
     return "\n".join(lines)
 
