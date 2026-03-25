@@ -11,11 +11,11 @@ on:
       mode:
         description: '运行模式'
         required: true
-        default: 'full'
+        default: 'market-only'  # 默认仅大盘复盘
         type: choice
         options:
+          - market-only   # 仅大盘复盘（默认）
           - full          # 完整分析（股票+大盘）
-          - market-only   # 仅大盘复盘
           - stocks-only   # 仅股票分析
       force_run:
         description: '强制运行（跳过交易日检查）'
