@@ -11,14 +11,13 @@ on:
       index_code:
         description: '筛选指数代码'
         required: false
-        default: '000852'
+        default: '000906'
         type: choice
         options:
-          - '000852'  # 中证1000
-          - '000857'  # 中证800
-          - '000903'  # 中证200
+          - '000906'  # 中证800（默认）
           - '000300'  # 沪深300
           - '000905'  # 中证500
+          - '000852'  # 中证1000
       top_n:
         description: '返回前 N 只股票'
         required: false
@@ -174,15 +173,14 @@ jobs:
           echo "🎯 每日股票筛选"
           echo "=========================================="
           echo "⏰ 时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
-          INDEX_CODE="${{ github.event.inputs.index_code || '000852' }}"
+          INDEX_CODE="${{ github.event.inputs.index_code || '000906' }}"
           TOP_N="${{ github.event.inputs.top_n || '2' }}"
 
           case "$INDEX_CODE" in
-            000852) INDEX_NAME="中证1000" ;;
-            000857) INDEX_NAME="中证800" ;;
-            000903) INDEX_NAME="中证200" ;;
+            000906) INDEX_NAME="中证800" ;;
             000300) INDEX_NAME="沪深300" ;;
             000905) INDEX_NAME="中证500" ;;
+            000852) INDEX_NAME="中证1000" ;;
             *) INDEX_NAME="指数$INDEX_CODE" ;;
           esac
 
