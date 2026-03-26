@@ -22,6 +22,7 @@
 """
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -175,10 +176,10 @@ class StockScreener:
 
     def _batch_fetch_daily_data(self, stock_codes: List[str]) -> int:
         """
-        批量获取股票日线数据（分批获取，减少API调用次数）
+        批量获取股票日线数据（带速率限制，适配 Tushare 120积分权限）
 
-        策略：每批50只股票，一次性获取89天数据
-        对于300只股票：6批 × 1次 = 6次API调用（而非300次）
+        Tushare 120积分限制：每分钟最多50次调用
+        策略：每获取40只股票后暂停60秒，留10次余量
 
         Args:
             stock_codes: 股票代码列表
@@ -190,26 +191,44 @@ class StockScreener:
             return 0
 
         total = len(stock_codes)
-        batch_size = self.BATCH_SIZE
         success_count = 0
 
-        logger.info(f"[批量获取] 开始获取 {total} 只股票的日线数据，每批 {batch_size} 只...")
+        # Tushare 120积分：每分钟50次，我们用40次后暂停
+        RATE_LIMIT = 40  # 每分钟最多调用次数（留余量）
+        RATE_WINDOW = 60  # 速率窗口（秒）
 
-        for i in range(0, total, batch_size):
-            batch = stock_codes[i:i + batch_size]
-            batch_num = (i // batch_size) + 1
-            total_batches = (total + batch_size - 1) // batch_size
+        logger.info(f"[批量获取] 开始获取 {total} 只股票的日线数据...")
+        logger.info(f"[速率限制] Tushare 120积分模式：每{RATE_WINDOW}秒最多{RATE_LIMIT}次调用")
 
-            logger.info(f"[批量获取] 第 {batch_num}/{total_batches} 批，共 {len(batch)} 只股票...")
+        call_count = 0  # 当前窗口内的调用次数
+        window_start = time.time()  # 窗口开始时间
 
-            for code in batch:
-                try:
-                    df, _ = self.fetcher_manager.get_daily_data(code, days=self.HISTORICAL_DAYS)
-                    if df is not None and not df.empty:
-                        self._daily_data_cache[code] = df
-                        success_count += 1
-                except Exception as e:
-                    logger.debug(f"[批量获取] {code} 获取失败: {e}")
+        for i, code in enumerate(stock_codes):
+            # 检查是否需要暂停（达到速率限制）
+            if call_count >= RATE_LIMIT:
+                elapsed = time.time() - window_start
+                if elapsed < RATE_WINDOW:
+                    wait_time = RATE_WINDOW - elapsed + 1  # 多等1秒确保安全
+                    logger.info(f"[速率限制] 已调用{call_count}次，暂停{wait_time:.0f}秒...")
+                    time.sleep(wait_time)
+                # 重置计数器
+                call_count = 0
+                window_start = time.time()
+
+            try:
+                df, _ = self.fetcher_manager.get_daily_data(code, days=self.HISTORICAL_DAYS)
+                call_count += 1
+
+                if df is not None and not df.empty:
+                    self._daily_data_cache[code] = df
+                    success_count += 1
+
+                # 每50只股票打印一次进度
+                if (i + 1) % 50 == 0:
+                    logger.info(f"[批量获取] 进度: {i + 1}/{total}, 成功: {success_count}")
+
+            except Exception as e:
+                logger.debug(f"[批量获取] {code} 获取失败: {e}")
 
         logger.info(f"[批量获取] 完成! 成功: {success_count}/{total}")
         return success_count
@@ -300,7 +319,8 @@ class StockScreener:
         数据获取逻辑与 pipeline.py 一致：
         1. 先批量获取所有股票的日线数据（减少API调用）
         2. 使用89天历史数据（~60交易日用于MA60）
-        3. 支持实时行情增强（盘中场景）
+
+        注意：盘后分析不需要实时行情增强
 
         Args:
             stock_codes: 股票代码列表
@@ -311,21 +331,8 @@ class StockScreener:
         """
         logger.info(f"[完整分析] 开始分析 {len(stock_codes)} 只股票...")
 
-        # Step 1: 批量获取日线数据（减少API调用次数）
+        # Step 1: 批量获取日线数据（减少API调用次数，带速率限制）
         self._batch_fetch_daily_data(stock_codes)
-
-        # Step 2: 尝试批量获取实时行情（用于增强数据）
-        realtime_quotes: Dict[str, Any] = {}
-        if self.config.enable_realtime_quote:
-            logger.info("[实时行情] 开始批量获取实时行情...")
-            for code in stock_codes:
-                try:
-                    quote = self.fetcher_manager.get_realtime_quote(code)
-                    if quote:
-                        realtime_quotes[code] = quote
-                except Exception as e:
-                    logger.debug(f"[实时行情] {code} 获取失败: {e}")
-            logger.info(f"[实时行情] 成功获取 {len(realtime_quotes)} 只股票的实时行情")
 
         scores = []
         success_count = 0
@@ -338,10 +345,6 @@ class StockScreener:
                 if df is None or len(df) < 30:
                     fail_count += 1
                     continue
-
-                # 实时行情增强（与pipeline.py一致）
-                if code in realtime_quotes:
-                    df = self._augment_historical_with_realtime(df, realtime_quotes[code], code)
 
                 # 使用 StockTrendAnalyzer 进行完整分析
                 result = self.trend_analyzer.analyze(df, code)
