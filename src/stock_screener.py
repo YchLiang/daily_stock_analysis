@@ -77,6 +77,7 @@ class StockScreener:
     """
 
     # 指数代码映射
+    ZZ800_INDEX = "000906"   # 中证800（默认）
     ZZ1000_INDEX = "000852"  # 中证1000
 
     # 数据获取参数（与 pipeline.py 一致）
@@ -91,7 +92,7 @@ class StockScreener:
         # 批量获取的日线数据缓存{code: DataFrame}
         self._daily_data_cache: Dict[str, pd.DataFrame] = {}
 
-    def get_index_constituents(self, index_code: str = ZZ1000_INDEX) -> List[str]:
+    def get_index_constituents(self, index_code: str = ZZ800_INDEX) -> List[str]:
         """
         获取指数成分股代码列表
 
@@ -419,12 +420,13 @@ class StockScreener:
             (筛选结果, 指数名称)
         """
         if index_code is None:
-            index_code = self.ZZ1000_INDEX
+            index_code = self.ZZ800_INDEX
 
         # 确定指数名称
         index_names = {
+            self.ZZ800_INDEX: "中证800",
             self.ZZ1000_INDEX: "中证1000",
-            "000857": "中证800",
+            "000906": "中证800",
             "000903": "中证200",
             "000300": "沪深300",
             "000905": "中证500",
