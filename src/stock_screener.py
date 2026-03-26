@@ -496,9 +496,9 @@ def format_screener_report(stocks: List[StockScore], index_name: str) -> str:
     has_buy_signal = any(s.buy_signal in [BuySignal.STRONG_BUY, BuySignal.BUY] for s in stocks)
 
     lines = [
-        f"# 🎯 {index_name} 每日优选股票",
+        f"# 🔥 {index_name} 每日推荐",
         f"",
-        f"## 📋 筛选结果（盘后分析）",
+        f">今日从{index_name}成分股中筛选出的优质股票",
         f"",
     ]
 
@@ -581,6 +581,167 @@ def format_screener_report(stocks: List[StockScore], index_name: str) -> str:
 
     # 添加免责声明
     lines.extend([
+        f"## ⚠️ 免责声明",
+        f"",
+        f"本报告仅供参考，不构成投资建议。股市有风险，投资需谨慎。",
+        f"",
+    ])
+
+    return "\n".join(lines)
+
+
+def format_combined_screener_report(
+    stocks: List[StockScore],
+    ai_results: List[Any],
+    index_name: str
+) -> str:
+    """
+    格式化合并报告（筛选结果 + AI 分析合并显示）
+
+    Args:
+        stocks: 筛选出的股票列表
+        ai_results: AI 分析结果列表 (AnalysisResult)
+        index_name: 指数名称
+
+    Returns:
+        Markdown 格式的合并报告
+    """
+    if not stocks:
+        return f"# 🔥 {index_name} 每日推荐\n\n今日未筛选出符合条件的股票。"
+
+    # 构建 AI 结果的映射（code -> AnalysisResult）
+    ai_map = {}
+    if ai_results:
+        for result in ai_results:
+            if hasattr(result, 'code'):
+                ai_map[result.code] = result
+
+    # 检查是否有买入信号
+    has_buy_signal = any(s.buy_signal in [BuySignal.STRONG_BUY, BuySignal.BUY] for s in stocks)
+
+    lines = [
+        f"# 🔥 {index_name} 每日推荐",
+        f"",
+        f"> 今日从{index_name}成分股中筛选出的优质股票",
+        f"",
+    ]
+
+    if has_buy_signal:
+        lines.extend([
+            f"**买入信号说明：**",
+            f"- 🔥 强烈买入：得分≥75 + 多头排列",
+            f"- ✅ 买入：得分≥60 + 多头/弱多头",
+            f"",
+        ])
+    else:
+        lines.extend([
+            f"⚠️ **今日没有股票满足买入条件**",
+            f"",
+            f"以下为得分最高的股票（仅供参考）：",
+            f"",
+        ])
+
+    # 遍历每只股票，合并显示技术分析和 AI 分析
+    for i, stock in enumerate(stocks, 1):
+        signal_emoji = "🔥" if stock.buy_signal == BuySignal.STRONG_BUY else "✅" if stock.buy_signal == BuySignal.BUY else "⏸️"
+
+        lines.extend([
+            f"---",
+            f"",
+            f"## #{i}{signal_emoji} {stock.name}({stock.code})",
+            f"",
+        ])
+
+        # === 技术分析部分 ===
+        lines.extend([
+            f"### 📊 技术分析",
+            f"",
+            f"| 指标 | 数值 | 状态 |",
+            f"|------|------|------|",
+            f"| **买入信号** | | **{stock.buy_signal.value}** |",
+            f"| **综合得分** | | **{stock.total_score}/100** |",
+            f"| 收盘价 | {stock.price:.2f} 元 | |",
+            f"| MA5 | {stock.ma5 or 'N/A':.2f} | |",
+            f"| MA10 | {stock.ma10 or 'N/A':.2f} | |",
+            f"| MA20 | {stock.ma20 or 'N/A':.2f} | |",
+            f"| 乖离率(MA5) | {stock.bias_ma5 or 0:+.2f}% | {'✅安全' if abs(stock.bias_ma5 or 0) <= 5 else '⚠️偏高'} |",
+            f"| 趋势强度 | {stock.trend_strength:.0f}/100 | |",
+            f"",
+        ])
+
+        # 如果有完整分析结果，添加更多技术指标
+        if stock.analysis_result:
+            result = stock.analysis_result
+            lines.extend([
+                f"**技术指标：**",
+                f"- 趋势状态: {result.trend_status.value}",
+                f"- MACD: {result.macd_status.value}",
+                f"- RSI: {result.rsi_status.value}",
+                f"- 量能: {result.volume_status.value}",
+                f"",
+            ])
+
+            if result.signal_reasons:
+                lines.append(f"**买入理由：**")
+                for reason in result.signal_reasons[:3]:
+                    lines.append(f"- {reason}")
+                lines.append(f"")
+
+            if result.risk_factors:
+                lines.append(f"**风险提示：**")
+                for risk in result.risk_factors[:2]:
+                    lines.append(f"- {risk}")
+                lines.append(f"")
+
+        # === AI 分析部分（如果有）===
+        ai_result = ai_map.get(stock.code)
+        if ai_result:
+            lines.extend([
+                f"### 🤖 AI 分析",
+                f"",
+            ])
+
+            # AI 综合评分
+            if hasattr(ai_result, 'sentiment_score') and ai_result.sentiment_score:
+                lines.extend([
+                    f"| AI 指标 | 数值 |",
+                    f"|---------|------|",
+                    f"| **综合评分** | {ai_result.sentiment_score}/100 |",
+                    f"| **趋势预测** | {ai_result.trend_prediction or 'N/A'} |",
+                    f"| **操作建议** | {ai_result.operation_advice or 'N/A'} |",
+                    f"| **置信度** | {ai_result.confidence_level or '中'} |",
+                    f"",
+                ])
+
+            # AI 分析摘要
+            if hasattr(ai_result, 'analysis_summary') and ai_result.analysis_summary:
+                lines.extend([
+                    f"**分析摘要：**",
+                    f"",
+                    f"{ai_result.analysis_summary}",
+                    f"",
+                ])
+
+            # 核心看点
+            if hasattr(ai_result, 'key_points') and ai_result.key_points:
+                lines.extend([
+                    f"**核心看点：**",
+                    f"{ai_result.key_points}",
+                    f"",
+                ])
+
+            # 风险提示
+            if hasattr(ai_result, 'risk_warning') and ai_result.risk_warning:
+                lines.extend([
+                    f"**⚠️ 风险提示：**",
+                    f"{ai_result.risk_warning}",
+                    f"",
+                ])
+
+    # 添加免责声明
+    lines.extend([
+        f"---",
+        f"",
         f"## ⚠️ 免责声明",
         f"",
         f"本报告仅供参考，不构成投资建议。股市有风险，投资需谨慎。",

@@ -707,24 +707,15 @@ def main() -> int:
                     stock_codes=screen_codes,
                     dry_run=args.dry_run,
                     send_notification=not args.no_notify,
-                    merge_notification=False,  # 筛选结果单独推送
+                    merge_notification=True,  # 跳过 pipeline 内部推送，由 main 层统一发送合并报告
                 )
 
-                # 步骤3: 生成综合报告（筛选摘要 + AI 决策仪表盘）
+                # 步骤3: 生成合并报告（技术分析 + AI 分析合并显示）
                 if results:
-                    from src.stock_screener import format_screener_report
+                    from src.stock_screener import format_combined_screener_report
 
-                    # 筛选摘要部分
-                    screener_report = format_screener_report(stocks, index_name)
-
-                    # AI 决策仪表盘部分
-                    dashboard_report = pipeline.notifier.generate_aggregate_report(
-                        results,
-                        'full' if config.report_type == 'full' else config.report_type,
-                    )
-
-                    # 合并报告
-                    combined_report = f"{screener_report}\n\n---\n\n# 🤖 AI 决策仪表盘\n\n{dashboard_report}"
+                    # 生成合并报告（每只股票的技术分析 + AI 分析合并在一起）
+                    combined_report = format_combined_screener_report(stocks, results, index_name)
 
                     # 推送综合报告
                     if not args.no_notify:
