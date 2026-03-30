@@ -347,18 +347,22 @@ class StockScreener:
                     fail_count += 1
                     continue
 
+                # 获取当日涨跌幅（从历史数据中获取，而非乖离率）
+                latest_row = df.iloc[-1]
+                change_pct = float(latest_row.get('pct_chg', 0)) if 'pct_chg' in latest_row else 0
+
                 # 使用 StockTrendAnalyzer 进行完整分析
                 result = self.trend_analyzer.analyze(df, code)
 
-                # 从分析结果获取股票名称
-                name = result.code  # StockTrendAnalyzer 不返回名称，使用代码
+                # 获取股票名称
+                name = self.fetcher_manager.get_stock_name(code, allow_realtime=False) or result.code
 
                 # 创建 StockScore 对象
                 score = StockScore(
                     code=code,
                     name=name,
                     price=result.current_price,
-                    change_pct=result.bias_ma5,  # 近似涨跌幅
+                    change_pct=change_pct,  # 当日涨跌幅（从 df['pct_chg'] 获取）
                     ma5=result.ma5,
                     ma10=result.ma10,
                     ma20=result.ma20,
