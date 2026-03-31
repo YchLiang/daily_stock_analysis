@@ -335,6 +335,12 @@ class StockScreener:
         # Step 1: 批量获取日线数据（减少API调用次数，带速率限制）
         self._batch_fetch_daily_data(stock_codes)
 
+        # Step 2: 批量预获取股票名称到缓存（避免后续逐个调用 stock_basic 接口）
+        # stock_basic 接口每分钟仅 1 次调用限制，批量获取可避免 800 次调用失败
+        logger.info("[股票名称] 批量预获取股票名称到缓存...")
+        self.fetcher_manager.batch_get_stock_names(stock_codes)
+        logger.info("[股票名称] 预获取完成")
+
         scores = []
         success_count = 0
         fail_count = 0
