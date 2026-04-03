@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import logging
+import json
 import re
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -280,7 +281,7 @@ class SystemConfigService:
             "model": resolved_model,
             "messages": [{"role": "user", "content": "Reply with OK"}],
             "temperature": 0,
-            "max_tokens": 8,
+            "max_tokens": 256,  # Increased to allow MiniMax-M2.7 thinking process + response
             "timeout": max(5.0, float(timeout_seconds)),
         }
         if selected_api_key:
@@ -290,13 +291,44 @@ class SystemConfigService:
 
         try:
             import litellm
+            from src.agent.llm_adapter import LLMToolAdapter
+
+            # Register custom model pricing for MiniMax models not in LiteLLM's built-in list
+            # This must be done before litellm.completion() to prevent cost calculation errors
+            # Reuses the registration logic from LLMToolAdapter to avoid code duplication
+            LLMToolAdapter._register_custom_model_pricing()
 
             started_at = time.perf_counter()
             response = litellm.completion(**call_kwargs)
             latency_ms = int((time.perf_counter() - started_at) * 1000)
             content = ""
             if response and getattr(response, "choices", None):
-                content = str(response.choices[0].message.content or "").strip()
+                choice = response.choices[0]
+                # MiniMax-M2.7 uses content_blocks format directly on choice (not inside message)
+                # Check both possible locations for content_blocks
+                content_blocks = None
+                if hasattr(choice, "content_blocks"):
+                    content_blocks = choice.content_blocks
+                elif hasattr(choice.message, "content_blocks"):
+                    content_blocks = choice.message.content_blocks
+
+                if content_blocks:
+                    # MiniMax response format: concatenate ALL text blocks
+                    # Handle both type=="text" with .text and .content fields
+                    text_parts = []
+                    for block in content_blocks:
+                        if getattr(block, "type", None) == "text":
+                            text = getattr(block, "text", "") or ""
+                            if text:
+                                text_parts.append(text)
+                        elif hasattr(block, "content") and block.content:
+                            text_parts.append(block.content)
+                    content = "".join(text_parts).strip()
+                else:
+                    # Standard OpenAI format
+                    message = getattr(choice, "message", None)
+                    if message:
+                        content = str(message.content or "").strip()
 
             if not content:
                 return {
@@ -350,9 +382,10 @@ class SystemConfigService:
         for item in items:
             key = item["key"].upper()
             value = item["value"]
+            field_schema = get_field_definition(key, value)
+            normalized_value = self._normalize_value_for_storage(value, field_schema)
             submitted_keys.add(key)
-            updates.append((key, value))
-            field_schema = get_field_definition(key)
+            updates.append((key, normalized_value))
             if bool(field_schema.get("is_sensitive", False)):
                 sensitive_keys.add(key)
 
@@ -447,6 +480,32 @@ class SystemConfigService:
                     )
                 )
 
+        startup_only_run_keys = submitted_keys & {
+            "RUN_IMMEDIATELY",
+        }
+        if startup_only_run_keys:
+            warnings.append(
+                (
+                    f"{', '.join(sorted(startup_only_run_keys))} 已写入 .env。"
+                    "它属于启动期单次运行配置：当前已运行的 WebUI/API 进程不会因为本次保存立即触发分析；"
+                    "请重启当前进程后，在非 schedule 模式下按新值生效。"
+                )
+            )
+
+        startup_only_schedule_keys = submitted_keys & {
+            "SCHEDULE_ENABLED",
+            "SCHEDULE_TIME",
+            "SCHEDULE_RUN_IMMEDIATELY",
+        }
+        if startup_only_schedule_keys:
+            warnings.append(
+                (
+                    f"{', '.join(sorted(startup_only_schedule_keys))} 已写入 .env。"
+                    "这些属于启动期调度配置：当前已运行的 WebUI/API 进程不会因为本次保存立即触发分析，"
+                    "也不会自动重建 scheduler；请重启当前进程，并以 schedule 模式重新启动后生效。"
+                )
+            )
+
         return warnings
 
     def apply_simple_updates(
@@ -522,7 +581,7 @@ class SystemConfigService:
         if not value.strip() and not is_required:
             return issues
 
-        if "\n" in value:
+        if ("\n" in value or "\r" in value) and data_type != "json":
             issues.append(
                 {
                     "key": key,
@@ -594,6 +653,40 @@ class SystemConfigService:
                     }
                 )
 
+        elif data_type == "json":
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                issues.append(
+                    {
+                        "key": key,
+                        "code": "invalid_json",
+                        "message": "Value must be valid JSON",
+                        "severity": "error",
+                        "expected": "valid JSON",
+                        "actual": value[:120],
+                    }
+                )
+            else:
+                if key == "AGENT_EVENT_ALERT_RULES_JSON":
+                    try:
+                        from src.agent.events import parse_event_alert_rules, validate_event_alert_rule
+
+                        rule_index = 0
+                        for rule_index, rule in enumerate(parse_event_alert_rules(parsed), start=1):
+                            validate_event_alert_rule(rule)
+                    except ValueError as exc:
+                        issues.append(
+                            {
+                                "key": key,
+                                "code": "invalid_event_rule",
+                                "message": f"Rule validation failed: {exc}",
+                                "severity": "error",
+                                "expected": "supported EventMonitor rule fields and enum values",
+                                "actual": f"rule #{rule_index or 1}",
+                            }
+                        )
+
         if "enum" in validation and value and value not in validation["enum"]:
             issues.append(
                 {
@@ -627,6 +720,22 @@ class SystemConfigService:
                 )
 
         return issues
+
+    @staticmethod
+    def _normalize_value_for_storage(value: str, field_schema: Dict[str, Any]) -> str:
+        """Normalize submitted values before persisting to the single-line .env file."""
+        if field_schema.get("data_type", "string") != "json":
+            return value
+
+        if not value.strip():
+            return value
+
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+
+        return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
     def _validate_numeric_range(key: str, numeric_value: float, validation: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -916,8 +1025,9 @@ class SystemConfigService:
                         "key": "LITELLM_MODEL",
                         "code": "missing_runtime_source",
                         "message": (
-                            "LITELLM_MODEL is set, but there are no enabled channel models "
-                            "or matching legacy API keys for it"
+                            "A primary model is selected, but no usable runtime source was found. "
+                            "Enable at least one channel with available models, or provide the "
+                            "matching provider API key so the model can be resolved."
                         ),
                         "severity": "error",
                         "expected": "enabled channel model or matching legacy API key",
@@ -938,8 +1048,9 @@ class SystemConfigService:
                         "key": "AGENT_LITELLM_MODEL",
                         "code": "missing_runtime_source",
                         "message": (
-                            "AGENT_LITELLM_MODEL is set, but there are no enabled channel models "
-                            "or matching legacy API keys for it"
+                            "An Agent primary model is selected, but no usable runtime source was found. "
+                            "Enable at least one channel with available models, or provide the "
+                            "matching provider API key so the model can be resolved."
                         ),
                         "severity": "error",
                         "expected": "enabled channel model or matching legacy API key",
@@ -962,8 +1073,8 @@ class SystemConfigService:
                         "key": "LITELLM_FALLBACK_MODELS",
                         "code": "missing_runtime_source",
                         "message": (
-                            "LITELLM_FALLBACK_MODELS contains models without enabled channels "
-                            "or matching legacy API keys"
+                            "Some fallback models do not have an enabled channel "
+                            "or matching API key available"
                         ),
                         "severity": "error",
                         "expected": "enabled channel models or matching legacy API keys",
@@ -978,8 +1089,8 @@ class SystemConfigService:
                         "key": "VISION_MODEL",
                         "code": "missing_runtime_source",
                         "message": (
-                            "VISION_MODEL is set, but there are no enabled channel models "
-                            "or matching legacy API keys for it"
+                            "A Vision model is selected, but there is no enabled channel "
+                            "or matching API key available for it"
                         ),
                         "severity": "warning",
                         "expected": "enabled channel model or matching legacy API key",
@@ -996,7 +1107,8 @@ class SystemConfigService:
                     "key": "LITELLM_MODEL",
                     "code": "unknown_model",
                     "message": (
-                        "LITELLM_MODEL is not declared by the current enabled channels. "
+                        "The selected primary model is not declared by the current enabled channels "
+                        "or advanced model routing config. "
                         f"Available models: {', '.join(available_models[:6])}"
                     ),
                     "severity": "error",
@@ -1021,7 +1133,8 @@ class SystemConfigService:
                     "key": "AGENT_LITELLM_MODEL",
                     "code": "unknown_model",
                     "message": (
-                        "AGENT_LITELLM_MODEL is not declared by the current enabled channels. "
+                        "The selected Agent primary model is not declared by the current enabled channels "
+                        "or advanced model routing config. "
                         f"Available models: {', '.join(available_models[:6])}"
                     ),
                     "severity": "error",
@@ -1045,7 +1158,8 @@ class SystemConfigService:
                     "key": "LITELLM_FALLBACK_MODELS",
                     "code": "unknown_model",
                     "message": (
-                        "LITELLM_FALLBACK_MODELS contains models that are not declared by the current enabled channels"
+                        "Fallback models include entries that are not declared by the current enabled channels "
+                        "or advanced model routing config"
                     ),
                     "severity": "error",
                     "expected": ",".join(available_models[:6]),
@@ -1060,7 +1174,8 @@ class SystemConfigService:
                     "key": "VISION_MODEL",
                     "code": "unknown_model",
                     "message": (
-                        "VISION_MODEL is not declared by the current enabled channels"
+                        "The selected Vision model is not declared by the current enabled channels "
+                        "or advanced model routing config"
                     ),
                     "severity": "warning",
                     "expected": ",".join(available_models[:6]),
