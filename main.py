@@ -840,12 +840,9 @@ def main() -> int:
             )
             return 0
 
-        # 模式1: 股票筛选 + AI 深度分析
+        # 模式1: 股票筛选 + AI 深度分析（与 daily_analysis.yml stocks-only 模式相同）
         if getattr(args, 'screen', False):
             from src.stock_screener import StockScreener
-            from src.analyzer import GeminiAnalyzer
-            from src.search_service import SearchService
-            from src.notification import NotificationService
             from src.core.pipeline import StockAnalysisPipeline
 
             logger.info("模式: 股票筛选 + AI 深度分析")
@@ -861,7 +858,7 @@ def main() -> int:
                 logger.info("初筛未找到符合条件的股票，结束筛选流程")
                 return 0
 
-            # 步骤2: AI 深度分析筛选出的股票
+            # 步骤2: 对筛选出的股票执行与 daily_analysis.yml stocks-only 相同的分析流程
             logger.info(f"\n{'=' * 60}")
             logger.info(f"🤖 开始对筛选出的 {len(stocks)} 只股票进行 AI 深度分析")
             logger.info(f"{'=' * 60}")
@@ -869,87 +866,27 @@ def main() -> int:
             # 提取股票代码
             screen_codes = [stock.code for stock in stocks]
 
-            # 初始化分析组件
-            search_service = None
-            analyzer = None
-            notifier = NotificationService()
-
-            # 初始化搜索服务（如果有配置）
-            if config.has_search_capability_enabled():
-                search_service = SearchService(
-                    bocha_keys=config.bocha_api_keys,
-                    tavily_keys=config.tavily_api_keys,
-                    brave_keys=config.brave_api_keys,
-                    serpapi_keys=config.serpapi_keys,
-                    minimax_keys=config.minimax_api_keys,
-                    searxng_base_urls=config.searxng_base_urls,
-                    searxng_public_instances_enabled=config.searxng_public_instances_enabled,
-                    news_max_age_days=config.news_max_age_days,
-                    news_strategy_profile=getattr(config, "news_strategy_profile", ("short",)),
-                )
-
-            # 初始化 AI 分析器（如果有配置）
-            if config.gemini_api_key or config.openai_api_key:
-                analyzer = GeminiAnalyzer(api_key=config.gemini_api_key)
-                if not analyzer.is_available():
-                    logger.warning("AI 分析器初始化后不可用，请检查 API Key 配置")
-                    analyzer = None
-            else:
-                logger.warning("未检测到 API Key (Gemini/OpenAI)，将仅使用模板生成报告")
-
-            # 创建分析 pipeline
+            # 使用与 daily_analysis.yml 相同的分析流程
             query_id = uuid.uuid4().hex
+            save_context_snapshot = None
+            if getattr(args, 'no_context_snapshot', False):
+                save_context_snapshot = False
+
             pipeline = StockAnalysisPipeline(
                 config=config,
                 max_workers=1,  # 筛选数量少，单线程即可
                 query_id=query_id,
                 query_source="screening",
-                save_context_snapshot=not getattr(args, 'no_context_snapshot', False),
+                save_context_snapshot=save_context_snapshot,
             )
 
-            # 执行 AI 分析
-            if analyzer:
-                results = pipeline.run(
-                    stock_codes=screen_codes,
-                    dry_run=args.dry_run,
-                    send_notification=not args.no_notify,
-                    merge_notification=True,  # 跳过 pipeline 内部推送，由 main 层统一发送合并报告
-                )
-
-                # 步骤3: 生成合并报告（技术分析 + AI 分析合并显示）
-                if results:
-                    from src.stock_screener import format_combined_screener_report
-
-                    # 生成合并报告（每只股票的技术分析 + AI 分析合并在一起）
-                    combined_report = format_combined_screener_report(stocks, results, index_name)
-
-                    # 推送综合报告
-                    if not args.no_notify:
-                        if notifier.is_available():
-                            notifier.send(combined_report)
-                            logger.info("筛选结果 + AI 分析已推送")
-                        else:
-                            logger.warning("未配置通知渠道，跳过推送")
-
-                    print(combined_report)
-                else:
-                    # 仅推送筛选摘要（没有 AI 结果）
-                    from src.stock_screener import format_screener_report
-                    screener_report = format_screener_report(stocks, index_name)
-                    if not args.no_notify:
-                        if notifier.is_available():
-                            notifier.send(screener_report)
-                            logger.info("筛选结果已推送")
-                    print(screener_report)
-            else:
-                # 没有 AI 分析器，仅推送筛选结果
-                from src.stock_screener import format_screener_report
-                screener_report = format_screener_report(stocks, index_name)
-                if not args.no_notify:
-                    if notifier.is_available():
-                        notifier.send(screener_report)
-                        logger.info("筛选结果已推送")
-                print(screener_report)
+            # 执行分析（与 daily_analysis.yml stocks-only 模式相同）
+            pipeline.run(
+                stock_codes=screen_codes,
+                dry_run=args.dry_run,
+                send_notification=not args.no_notify,
+                merge_notification=False,  # 由 pipeline 自己生成报告并推送
+            )
 
             return 0
 
