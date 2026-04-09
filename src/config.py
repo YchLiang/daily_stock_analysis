@@ -498,6 +498,7 @@ class Config:
     vision_provider_priority: str = "gemini,anthropic,openai"
 
     # === 搜索引擎配置（支持多 Key 负载均衡）===
+    anspire_api_keys: List[str] = field(default_factory=list)  # Anspire Search API Keys
     bocha_api_keys: List[str] = field(default_factory=list)  # Bocha API Keys
     minimax_api_keys: List[str] = field(default_factory=list)  # MiniMax API Keys
     tavily_api_keys: List[str] = field(default_factory=list)  # Tavily API Keys
@@ -543,6 +544,8 @@ class Config:
     
     # 飞书 Webhook
     feishu_webhook_url: Optional[str] = None
+    feishu_webhook_secret: Optional[str] = None  # 自定义机器人签名密钥（可选）
+    feishu_webhook_keyword: Optional[str] = None  # 自定义机器人关键词（可选）
     
     # Telegram 配置（需要同时配置 Bot Token 和 Chat ID）
     telegram_bot_token: Optional[str] = None  # Bot Token（@BotFather 获取）
@@ -630,6 +633,10 @@ class Config:
 
     # === 数据库配置 ===
     database_path: str = "./data/stock_analysis.db"
+    sqlite_wal_enabled: bool = True
+    sqlite_busy_timeout_ms: int = 5000
+    sqlite_write_retry_max: int = 3
+    sqlite_write_retry_base_delay: float = 0.1
 
     # 是否保存分析上下文快照（用于历史回溯）
     save_context_snapshot: bool = True
@@ -1013,6 +1020,10 @@ class Config:
         )
 
         # 解析搜索引擎 API Keys（支持多个 key，逗号分隔）
+        # Anspire Search
+        anspire_keys_str = os.getenv('ANSPIRE_API_KEYS', '')
+        anspire_api_keys = [k.strip() for k in anspire_keys_str.split(',') if k.strip()]
+
         bocha_keys_str = os.getenv('BOCHA_API_KEYS', '')
         bocha_api_keys = [k.strip() for k in bocha_keys_str.split(',') if k.strip()]
 
@@ -1145,6 +1156,7 @@ class Config:
                 or ""
             ),
             vision_provider_priority=os.getenv('VISION_PROVIDER_PRIORITY', 'gemini,anthropic,openai'),
+            anspire_api_keys=anspire_api_keys,
             bocha_api_keys=bocha_api_keys,
             minimax_api_keys=minimax_api_keys,
             tavily_api_keys=tavily_api_keys,
@@ -1206,6 +1218,8 @@ class Config:
             agent_event_alert_rules_json=os.getenv('AGENT_EVENT_ALERT_RULES_JSON', ''),
             wechat_webhook_url=os.getenv('WECHAT_WEBHOOK_URL'),
             feishu_webhook_url=os.getenv('FEISHU_WEBHOOK_URL'),
+            feishu_webhook_secret=os.getenv('FEISHU_WEBHOOK_SECRET'),
+            feishu_webhook_keyword=os.getenv('FEISHU_WEBHOOK_KEYWORD'),
             telegram_bot_token=os.getenv('TELEGRAM_BOT_TOKEN'),
             telegram_chat_id=os.getenv('TELEGRAM_CHAT_ID'),
             telegram_message_thread_id=os.getenv('TELEGRAM_MESSAGE_THREAD_ID'),
@@ -1263,6 +1277,25 @@ class Config:
             md2img_engine=cls._parse_md2img_engine(os.getenv('MD2IMG_ENGINE', 'wkhtmltoimage')),
             prefetch_realtime_quotes=os.getenv('PREFETCH_REALTIME_QUOTES', 'true').lower() == 'true',
             database_path=os.getenv('DATABASE_PATH', './data/stock_analysis.db'),
+            sqlite_wal_enabled=os.getenv('SQLITE_WAL_ENABLED', 'true').lower() == 'true',
+            sqlite_busy_timeout_ms=parse_env_int(
+                os.getenv('SQLITE_BUSY_TIMEOUT_MS'),
+                5000,
+                field_name='SQLITE_BUSY_TIMEOUT_MS',
+                minimum=0,
+            ),
+            sqlite_write_retry_max=parse_env_int(
+                os.getenv('SQLITE_WRITE_RETRY_MAX'),
+                3,
+                field_name='SQLITE_WRITE_RETRY_MAX',
+                minimum=0,
+            ),
+            sqlite_write_retry_base_delay=parse_env_float(
+                os.getenv('SQLITE_WRITE_RETRY_BASE_DELAY'),
+                0.1,
+                field_name='SQLITE_WRITE_RETRY_BASE_DELAY',
+                minimum=0.0,
+            ),
             save_context_snapshot=os.getenv('SAVE_CONTEXT_SNAPSHOT', 'true').lower() == 'true',
             backtest_enabled=os.getenv('BACKTEST_ENABLED', 'true').lower() == 'true',
             backtest_eval_window_days=parse_env_int(os.getenv('BACKTEST_EVAL_WINDOW_DAYS'), 10, field_name='BACKTEST_EVAL_WINDOW_DAYS', minimum=1),
@@ -1872,7 +1905,8 @@ class Config:
     def has_search_capability_enabled(self) -> bool:
         """Whether any search provider is configured or SearXNG fallback is enabled."""
         return bool(
-            self.bocha_api_keys
+            self.anspire_api_keys
+            or self.bocha_api_keys
             or self.minimax_api_keys
             or self.tavily_api_keys
             or self.brave_api_keys
@@ -2145,6 +2179,31 @@ class Config:
                 severity="warning",
                 message="未配置通知渠道，将不发送推送通知",
                 field="WECHAT_WEBHOOK_URL",
+            ))
+
+        has_feishu_app_id = bool((self.feishu_app_id or "").strip())
+        has_feishu_app_secret = bool((self.feishu_app_secret or "").strip())
+        has_feishu_app_credentials = has_feishu_app_id or has_feishu_app_secret
+        has_feishu_doc_token = bool((self.feishu_folder_token or "").strip())
+        has_feishu_full_cloud_doc_credentials = (
+            has_feishu_app_id
+            and has_feishu_app_secret
+            and has_feishu_doc_token
+        )
+        if (
+            has_feishu_app_credentials
+            and not has_feishu_full_cloud_doc_credentials
+            and not self.feishu_webhook_url
+            and not (self.feishu_stream_enabled and has_feishu_app_id and has_feishu_app_secret)
+        ):
+            issues.append(ConfigIssue(
+                severity="warning",
+                message=(
+                    "仅配置 FEISHU_APP_ID / FEISHU_APP_SECRET 不会开启飞书群 Webhook 推送；"
+                    "如需群消息通知，请配置 FEISHU_WEBHOOK_URL。若要使用应用机器人，请同时开启 "
+                    "FEISHU_STREAM_ENABLED 并完成应用发布与权限配置。"
+                ),
+                field="FEISHU_WEBHOOK_URL",
             ))
 
         # --- Deprecated field migration hints ---
