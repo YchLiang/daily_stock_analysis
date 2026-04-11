@@ -137,8 +137,13 @@ class StockScreener:
                 logger.error(f"成分股数据中没有股票代码字段: {df.columns.tolist()}")
                 return []
 
-            logger.info(f"成功获取 {len(codes)} 只成分股")
-            return codes
+            # 去重：中证800 = 沪深300 + 中证500，存在重叠成分
+            seen = set()
+            unique_codes = [c for c in codes if not (c in seen or seen.add(c))]
+            if len(unique_codes) < len(codes):
+                logger.info(f"成分股去重: {len(codes)} -> {len(unique_codes)}")
+            logger.info(f"成功获取 {len(unique_codes)} 只成分股")
+            return unique_codes
 
         except Exception as e:
             logger.error(f"获取指数成分股失败: {e}")
