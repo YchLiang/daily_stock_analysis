@@ -525,7 +525,9 @@ class AkshareFetcher(BaseFetcher):
         """
         获取 ETF 基金历史数据
         
-        数据来源：ak.fund_etf_hist_em()
+        策略：
+        1. 优先尝试东方财富接口 (ak.fund_etf_hist_em)
+        2. 失败后尝试新浪财经接口 (ak.fund_etf_hist_sina)
         
         Args:
             stock_code: ETF 代码，如 '512400', '159883'
@@ -535,6 +537,21 @@ class AkshareFetcher(BaseFetcher):
         Returns:
             ETF 历史数据 DataFrame
         """
+        # 尝试东方财富接口
+        try:
+            return self._fetch_etf_data_em(stock_code, start_date, end_date)
+        except Exception as em_err:
+            logger.warning(f"[ETF-东财] {stock_code} 获取失败，尝试新浪源: {em_err}")
+        
+        # 回退到新浪接口
+        try:
+            return self._fetch_etf_data_sina(stock_code, start_date, end_date)
+        except Exception as sina_err:
+            raise DataFetchError(
+                f"Akshare ETF 数据获取全部失败(东财+新浪): 东财={em_err}, 新浪={sina_err}"
+            ) from sina_err
+    
+    def _fetch_etf_data_em(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         import akshare as ak
         
         # 防封禁策略 1: 随机 User-Agent
@@ -581,6 +598,77 @@ class AkshareFetcher(BaseFetcher):
                 raise RateLimitError(f"Akshare 可能被限流: {e}") from e
             
             raise DataFetchError(f"Akshare 获取 ETF 数据失败: {e}") from e
+    
+    def _fetch_etf_data_sina(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        获取 ETF 基金历史数据（新浪财经 fallback）
+        
+        数据来源：ak.fund_etf_hist_sina()
+        优点：不受东财 IP 封禁影响
+        
+        Args:
+            stock_code: ETF 代码
+            start_date: 开始日期
+            end_date: 结束日期
+            
+        Returns:
+            ETF 历史数据 DataFrame（中文列名格式）
+        """
+        import akshare as ak
+        
+        self._enforce_rate_limit()
+        
+        # 转换为新浪代码格式
+        code = stock_code.strip()
+        if code.startswith(('51', '56', '58', '55', '52', '50', '54')):
+            symbol = f'sh{code}'
+        else:
+            symbol = f'sz{code}'
+        
+        logger.info(f"[API调用] ak.fund_etf_hist_sina(symbol={symbol}) [ETF-新浪fallback]")
+        
+        try:
+            import time as _time
+            api_start = _time.time()
+            
+            df = ak.fund_etf_hist_sina(symbol=symbol)
+            
+            api_elapsed = _time.time() - api_start
+            
+            if df is None or df.empty:
+                raise DataFetchError(f"新浪源 ETF {stock_code} 返回空数据")
+            
+            logger.info(f"[API返回] ak.fund_etf_hist_sina 成功: {len(df)} 行, 耗时 {api_elapsed:.2f}s")
+            
+            # 新浪返回列名: date, open, high, low, close, volume, amount
+            # 需要转换为中文列名以匹配 _normalize_data
+            rename_map = {
+                'date': '日期',
+                'open': '开盘',
+                'high': '最高',
+                'low': '最低',
+                'close': '收盘',
+                'volume': '成交量',
+                'amount': '成交额',
+            }
+            df = df.rename(columns=rename_map)
+            
+            # 计算涨跌幅
+            if '收盘' in df.columns:
+                df['涨跌幅'] = df['收盘'].pct_change() * 100
+                df['涨跌幅'] = df['涨跌幅'].fillna(0)
+            
+            # 按日期过滤（转换为 datetime 再比较）
+            if '日期' in df.columns:
+                df['日期'] = pd.to_datetime(df['日期'])
+                start_dt = pd.to_datetime(start_date)
+                end_dt = pd.to_datetime(end_date)
+                df = df[(df['日期'] >= start_dt) & (df['日期'] <= end_dt)]
+            
+            return df
+            
+        except Exception as e:
+            raise DataFetchError(f"新浪源 ETF {stock_code} 获取失败: {e}") from e
     
     def _fetch_us_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """

@@ -995,7 +995,23 @@ class DataFetcherManager:
             logger.error(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
             raise DataFetchError(error_summary)
 
+        # ---- 通用数据源循环（A 股 / ETF / 港股）----
+        # 连续失败降级：跟踪本次调用链中每个 fetcher 的连续失败次数
+        # 连续失败达阈值的 fetcher 在本轮调用中跳过，避免无谓等待
+        _skip_fail_threshold = 2  # 连续失败 2 次后本轮跳过
+        _consecutive_failures: Dict[str, int] = {}  # {fetcher_name: fail_count}
+
         for attempt, fetcher in enumerate(fetchers, start=1):
+            fname = fetcher.name
+
+            # 检查是否应跳过（连续失败降级）
+            if _consecutive_failures.get(fname, 0) >= _skip_fail_threshold:
+                logger.debug(
+                    f"[数据源跳过] {stock_code}: [{fname}] 连续失败 "
+                    f"{_consecutive_failures[fname]} 次，本轮跳过"
+                )
+                continue
+
             try:
                 logger.info(f"[数据源尝试 {attempt}/{total_fetchers}] [{fetcher.name}] 获取 {stock_code}...")
                 df = self._call_fetcher_method(
@@ -1016,6 +1032,9 @@ class DataFetcherManager:
                     return df, fetcher.name
                     
             except Exception as e:
+                # 记录连续失败
+                _consecutive_failures[fname] = _consecutive_failures.get(fname, 0) + 1
+
                 error_type, error_reason = summarize_exception(e)
                 error_msg = f"[{fetcher.name}] ({error_type}) {error_reason}"
                 logger.warning(
@@ -1023,9 +1042,16 @@ class DataFetcherManager:
                     f"error_type={error_type}, reason={error_reason}"
                 )
                 errors.append(error_msg)
-                if attempt < total_fetchers:
-                    next_fetcher = fetchers[attempt]
-                    logger.info(f"[数据源切换] {stock_code}: [{fetcher.name}] -> [{next_fetcher.name}]")
+
+                # 查找下一个未被跳过的 fetcher
+                next_idx = attempt  # 0-based index of next fetcher
+                while next_idx < len(fetchers):
+                    next_name = fetchers[next_idx].name
+                    if _consecutive_failures.get(next_name, 0) < _skip_fail_threshold:
+                        break
+                    next_idx += 1
+                if next_idx < len(fetchers) and next_idx != attempt:
+                    logger.info(f"[数据源切换] {stock_code}: [{fetcher.name}] -> [{fetchers[next_idx].name}]")
                 # 继续尝试下一个数据源
                 continue
         
